@@ -1,0 +1,57 @@
+name: Build Android APK (Pydroid 3)
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Biên Dịch APK Android với Buildozer
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Kiểm tra mã nguồn (Checkout)
+        uses: actions/checkout@v4
+
+      - name: Cài đặt JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Cài đặt Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Cài đặt các gói phụ thuộc hệ thống Linux
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git zip unzip autoconf libtool pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 cmake libffi-dev libssl-dev libltdl-dev
+
+      - name: Cài đặt Buildozer và Cython
+        run: |
+          pip install --upgrade pip
+          pip install Cython==0.29.36 buildozer virtualenv
+
+      - name: Bộ nhớ đệm Buildozer Cache (Tăng tốc độ build)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.buildozer
+            .buildozer
+          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+          restore-keys: |
+            buildozer-${{ runner.os }}-
+
+      - name: Biên dịch file app-debug.apk
+        run: |
+          buildozer android debug
+
+      - name: Tải tập tin APK thành phẩm lên GitHub Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: PydroidApp-debug-apk
+          path: bin/*.apk
+          retention-days: 14
