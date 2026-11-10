@@ -31,7 +31,7 @@ jobs:
 
       - name: 5. Cài đặt các gói phụ thuộc
         run: |
-          npm install
+          npm install --legacy-peer-deps
 
       - name: 6. Xây dựng các tài nguyên ứng dụng web
         run: |
@@ -39,9 +39,11 @@ jobs:
 
       - name: 7. Cài đặt và tích hợp Capacitor Android
         run: |
-          npm install --save-dev @capacitor/core @capacitor/cli @capacitor/android
+          npm install --save-dev --legacy-peer-deps @capacitor/core @capacitor/cli @capacitor/android
           npx cap init "Pydroid 3 Web" "org.pydroid3.web" --web-dir dist
-          npx cap add android || true
+          if [ ! -d "android" ]; then
+            npx cap add android
+          fi
           npx cap sync android
 
       - name: 8. Cấp quyền thực thi cho Gradle
@@ -52,7 +54,11 @@ jobs:
         run: |
           cd android && ./gradlew assembleDebug
 
-      - name: 10. Tải lên file APK (Tải xuống trên điện thoại)
+      - name: 10. Tìm và xác minh tệp APK đã tạo
+        run: |
+          ls -la android/app/build/outputs/apk/debug/
+
+      - name: 11. Tải lên file APK (Tải xuống trên điện thoại)
         uses: actions/upload-artifact@v4
         with:
           name: Pydroid3-Web-Debug-APK
