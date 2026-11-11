@@ -23,7 +23,7 @@ jobs:
       - name: Cài đặt Python 3.10
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.11'
 
       - name: Cài đặt các gói phụ thuộc hệ thống Linux
         run: |
@@ -33,7 +33,7 @@ jobs:
       - name: Cài đặt Buildozer và Cython
         run: |
           pip install --upgrade pip
-          pip install Cython==0.29.36 buildozer virtualenv
+          pip install "Cython>=3.0.0,<3.1.0" buildozer virtualenv
 
       - name: Bộ nhớ đệm Buildozer Cache (Tăng tốc độ build)
         uses: actions/cache@v4
