@@ -1,7 +1,7 @@
 [app]
 
 # (str) Title of your application
-title = PydroidApp
+title = Pydroid App
 
 # (str) Package name
 package.name = pydroid_app
@@ -19,10 +19,9 @@ source.include_exts = py,png,jpg,kv,atlas,json,txt,md,ttf,otf
 version = 1.0.0
 
 # (list) Application requirements
-# Core requirements include kivy, pillow, certifi, and android for crash-free startup
 requirements = python3,kivy==2.3.0,pillow,certifi,android
 
-# (str) Supported orientation (one of landscape, sensorLandscape, portrait or all)
+# (str) Supported orientation
 orientation = portrait
 
 # (list) Permissions
@@ -34,23 +33,23 @@ android.api = 33
 # (int) Minimum API your APK will support.
 android.minapi = 21
 
+# (int) Android NDK API to use (matching minapi)
+android.ndk_api = 21
+
 # (str) Android NDK version to use
 android.ndk = 25b
 
-# (bool) If True, automatically accept SDK license agreements (mandatory for CI / GitHub Actions)
+# (bool) If True, automatically accept SDK license agreements
 android.accept_sdk_license = True
 
-# (bool) Use --private data storage (True) or --dir public storage (False)
+# (bool) Use --private data storage
 android.private_storage = True
 
 # (list) The Android architectures to build for.
-# arm64-v8a is the modern 64-bit standard for Android 9 - 15, preventing 32-bit crashes.
 android.archs = arm64-v8a
 
-# (bool) enables Android auto backup feature (Android API >=23)
+# (bool) enables Android auto backup feature
 android.allow_backup = True
-
-# (str) The format used to package the app for release mode (aab or apk or default).
 
 # (str) Android logcat filters to aid troubleshooting
 android.logcat_filters = *:S python:D
@@ -60,5 +59,5 @@ android.logcat_filters = *:S python:D
 # (int) Log level (0 = error only, 1 = info, 2 = debug with command-line)
 log_level = 2
 
-# (int) Display warning if buildozer is run as root (0 = False, 1 = True)
+# (int) Display warning if buildozer is run as root
 warn_on_root = 1
