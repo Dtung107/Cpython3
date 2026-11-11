@@ -51,7 +51,6 @@ android.archs = arm64-v8a
 android.allow_backup = True
 
 # (str) The format used to package the app for release mode (aab or apk or default).
-android.release_artifact = apk
 
 # (str) Android logcat filters to aid troubleshooting
 android.logcat_filters = *:S python:D
