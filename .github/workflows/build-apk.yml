@@ -7,21 +7,21 @@ on:
 
 jobs:
   build:
-    name: Biên Dịch APK Android với Buildozer
+    name: Build Android APK with Buildozer
     runs-on: ubuntu-latest
 
     steps:
-      - name: 1. Kiểm tra mã nguồn (Checkout)
+      - name: 1. Checkout repository
         uses: actions/checkout@v4
 
-      - name: 2. Biên dịch APK Android với Buildozer Action
+      - name: 2. Build APK with Buildozer
         uses: ArtemSBulgakov/buildozer-action@v1
         id: buildozer
         with:
           workdir: .
-          buildozer_version: master
+          buildozer_version: stable
 
-      - name: 3. Tải tập tin APK thành phẩm lên GitHub Artifacts
+      - name: 3. Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: PydroidApp-debug-apk
