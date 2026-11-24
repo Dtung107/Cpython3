@@ -127,15 +127,8 @@ jobs:
                   /(<activity[^>]*android:name="\.MainActivity"[^>]*>)/,
                   `$1\n${deepLinkFilter}`
                 );
+                fs.writeFileSync(manifestPath, manifest, "utf8");
               }
-              if (!manifest.includes("WRITE_EXTERNAL_STORAGE")) {
-                const storagePerms = `    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />\n    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="32" />`;
-                manifest = manifest.replace(
-                  /<application/,
-                  `${storagePerms}\n\n    <application`
-                );
-              }
-              fs.writeFileSync(manifestPath, manifest, "utf8");
             }
             const p = "android/app/src/main/res/values/styles.xml";
             if (fs.existsSync(p)) {

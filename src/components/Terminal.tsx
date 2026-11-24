@@ -13,7 +13,6 @@ import {
   AlertTriangle,
   Image as ImageIcon,
   X,
-  Square,
 } from 'lucide-react';
 import { ExecutionResult } from '../types';
 
@@ -21,7 +20,6 @@ interface TerminalProps {
   result: ExecutionResult | null;
   isRunning: boolean;
   onRun: (customInputs?: string[]) => void;
-  onStop?: () => void;
   onClear: () => void;
   onDebugAI: () => void;
   activeEngine: string;
@@ -30,14 +28,12 @@ interface TerminalProps {
   inputPromptText?: string;
   preloadedStdin: string;
   onChangePreloadedStdin: (val: string) => void;
-  statusMessage?: string | null;
 }
 
 export const Terminal: React.FC<TerminalProps> = ({
   result,
   isRunning,
   onRun,
-  onStop,
   onClear,
   onDebugAI,
   activeEngine,
@@ -46,34 +42,19 @@ export const Terminal: React.FC<TerminalProps> = ({
   inputPromptText,
   preloadedStdin,
   onChangePreloadedStdin,
-  statusMessage,
 }) => {
   const [inputValue, setInputValue] = useState('');
   const [showStdinModal, setShowStdinModal] = useState(false);
   const [copied, setCopied] = useState(false);
   const [selectedPlot, setSelectedPlot] = useState<string | null>(null);
   const [dismissedError, setDismissedError] = useState(false);
-  const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const terminalEndRef = useRef<HTMLDivElement>(null);
   const inputFieldRef = useRef<HTMLInputElement>(null);
-  const scrollRafRef = useRef<number | null>(null);
 
-  // Smooth, zero-lag auto-scroll batched to animation frame (prevents Android WebView jitter on print loops)
+  // Auto-scroll when output changes
   useEffect(() => {
-    if (scrollRafRef.current !== null) return;
-    scrollRafRef.current = requestAnimationFrame(() => {
-      scrollRafRef.current = null;
-      const el = scrollContainerRef.current;
-      if (el) {
-        el.scrollTop = el.scrollHeight;
-      }
-    });
-    return () => {
-      if (scrollRafRef.current !== null) {
-        cancelAnimationFrame(scrollRafRef.current);
-        scrollRafRef.current = null;
-      }
-    };
-  }, [result?.stdout, result?.stderr, isRunning, isWaitingInput, statusMessage]);
+    terminalEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [result?.stdout, result?.stderr, isRunning, isWaitingInput]);
 
   // Focus bottom input when waiting for user input
   useEffect(() => {
@@ -161,26 +142,15 @@ export const Terminal: React.FC<TerminalProps> = ({
             <Trash2 className="w-3.5 h-3.5" />
           </button>
 
-          {/* Rerun / Stop Button */}
-          {isRunning && onStop ? (
-            <button
-              onClick={onStop}
-              title="Dừng chạy"
-              className="px-2 py-1 rounded bg-rose-600/90 hover:bg-rose-500 text-white text-[11px] font-bold flex items-center space-x-1 transition active:scale-95"
-            >
-              <Square className="w-3 h-3 fill-current" />
-              <span>Dừng</span>
-            </button>
-          ) : (
-            <button
-              onClick={() => onRun()}
-              disabled={isRunning}
-              title="Chạy lại chương trình"
-              className="p-1.5 rounded bg-[#1c2232] hover:bg-[#252c40] text-emerald-400 hover:text-emerald-300 transition disabled:opacity-40"
-            >
-              <RotateCw className={`w-3.5 h-3.5 ${isRunning ? 'animate-spin' : ''}`} />
-            </button>
-          )}
+          {/* Rerun Button (Screenshot 1) */}
+          <button
+            onClick={() => onRun()}
+            disabled={isRunning}
+            title="Chạy lại chương trình"
+            className="p-1.5 rounded bg-[#1c2232] hover:bg-[#252c40] text-emerald-400 hover:text-emerald-300 transition disabled:opacity-40"
+          >
+            <RotateCw className={`w-3.5 h-3.5 ${isRunning ? 'animate-spin' : ''}`} />
+          </button>
         </div>
       </div>
 
@@ -229,7 +199,7 @@ export const Terminal: React.FC<TerminalProps> = ({
       )}
 
       {/* Terminal Main Output Screen */}
-      <div ref={scrollContainerRef} className="flex-1 overflow-y-auto p-3.5 leading-relaxed space-y-2 select-text text-[13px]">
+      <div className="flex-1 overflow-y-auto p-3.5 leading-relaxed space-y-2 select-text text-[13px]">
         {/* Startup / Placeholder Banner (Screenshot 1) */}
         {!result?.stdout && !result?.stderr && !isRunning && !isWaitingInput && (
           <div className="text-slate-400 text-xs italic">
@@ -310,11 +280,11 @@ export const Terminal: React.FC<TerminalProps> = ({
         {isRunning && (
           <div className="flex items-center space-x-2 text-amber-400 py-1">
             <div className="w-2.5 h-2.5 rounded-full bg-amber-400 animate-ping" />
-            <span className="text-xs">
-              {statusMessage || 'Đang thực thi mã nguồn Python...'}
-            </span>
+            <span className="text-xs">Đang thực thi mã nguồn Python...</span>
           </div>
         )}
+
+        <div ref={terminalEndRef} />
       </div>
 
       {/* Compact Floating Dismissable Error Pill - ONLY appears when there is a real error */}

@@ -1,7 +1,7 @@
 import express from 'express';
 import http from 'http';
 import { GoogleGenAI, Type, ThinkingLevel } from '@google/genai';
-import { spawn, spawnSync } from 'child_process';
+import { spawn } from 'child_process';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
@@ -878,190 +878,6 @@ ${currentCode ? `\n\n[MÃ NGUỒN HIỆN TẠI TRONG EDITOR]:\n\`\`\`python\n${c
   }
 });
 
-let cachedPythonBin: string | null = null;
-function getPythonBinary(): string {
-  if (cachedPythonBin) return cachedPythonBin;
-  for (const candidate of ['python3', 'python']) {
-    try {
-      const check = spawnSync(candidate, ['--version'], { stdio: 'ignore', timeout: 2000 });
-      if (check.status === 0) {
-        cachedPythonBin = candidate;
-        return candidate;
-      }
-    } catch {
-      // try next
-    }
-  }
-  cachedPythonBin = 'python3';
-  return cachedPythonBin;
-}
-
-const SAFE_PIP_SPEC_REGEX = /^[a-zA-Z0-9._\-\[\]<>=!~,]+$/;
-let cachedPipList: { packages: string[]; fetchedAt: number } | null = null;
-
-// Endpoint: List installed Python packages on CPython server
-app.get('/api/python/pip/list', (_req, res) => {
-  const now = Date.now();
-  if (cachedPipList && now - cachedPipList.fetchedAt < 30_000) {
-    return res.json({ success: true, packages: cachedPipList.packages });
-  }
-
-  const pyBin = getPythonBinary();
-  const listScript = `
-import json, importlib.metadata
-names = sorted({
-    str(d.metadata.get("Name") or "").strip().lower()
-    for d in importlib.metadata.distributions()
-    if d.metadata and d.metadata.get("Name")
-})
-print(json.dumps(names))
-`;
-  const proc = spawn(pyBin, ['-c', listScript], {
-    timeout: 6000,
-    env: { ...process.env, PYTHONIOENCODING: 'utf-8' },
-  });
-
-  let out = '';
-  proc.stdout.on('data', (d) => {
-    out += d.toString();
-  });
-
-  proc.on('close', (code) => {
-    if (code !== 0) {
-      return res.json({ success: false, packages: cachedPipList?.packages || [] });
-    }
-    try {
-      const parsed = JSON.parse(out);
-      const packages = Array.isArray(parsed)
-        ? parsed.map((name: any) => String(name || '').trim().toLowerCase()).filter(Boolean)
-        : [];
-      cachedPipList = { packages, fetchedAt: Date.now() };
-      return res.json({ success: true, packages });
-    } catch {
-      return res.json({ success: false, packages: cachedPipList?.packages || [] });
-    }
-  });
-
-  proc.on('error', () => {
-    return res.json({ success: false, packages: [] });
-  });
-});
-
-// Endpoint: Install a Python package via pip on CPython server
-app.post('/api/python/pip/install', (req, res) => {
-  const rawPkg = typeof req.body?.packageName === 'string' ? req.body.packageName.trim() : '';
-  if (!rawPkg || rawPkg.length > 100 || !SAFE_PIP_SPEC_REGEX.test(rawPkg)) {
-    return res.status(400).json({
-      success: false,
-      error: 'Tên thư viện pip không hợp lệ.',
-    });
-  }
-
-  const pyBin = getPythonBinary();
-  const proc = spawn(
-    pyBin,
-    ['-m', 'pip', 'install', '--no-input', '--disable-pip-version-check', rawPkg],
-    {
-      timeout: 55000,
-      env: { ...process.env, PYTHONIOENCODING: 'utf-8', PIP_DISABLE_PIP_VERSION_CHECK: '1' },
-    }
-  );
-
-  let stdout = '';
-  let stderr = '';
-  proc.stdout.on('data', (d) => {
-    stdout += d.toString();
-  });
-  proc.stderr.on('data', (d) => {
-    stderr += d.toString();
-  });
-
-  proc.on('close', (code) => {
-    cachedPipList = null;
-    const baseName = rawPkg.split(/[=<>!~\[]/)[0].trim().toLowerCase();
-    if (code === 0) {
-      return res.json({
-        success: true,
-        packageName: baseName,
-        output: stdout.trim(),
-      });
-    }
-    return res.status(400).json({
-      success: false,
-      error: stderr.trim() || stdout.trim() || `Cài đặt ${rawPkg} thất bại (mã ${code}).`,
-    });
-  });
-
-  proc.on('error', (err) => {
-    return res.status(500).json({
-      success: false,
-      error: `Không thể chạy pip trên máy chủ: ${err.message}`,
-    });
-  });
-});
-
-let cachedCPythonWarmInfo: { available: boolean; pythonVersion: string; warmedAt: number } | null = null;
-let inflightCPythonWarm: Promise<{ available: boolean; pythonVersion: string }> | null = null;
-
-async function ensureCPythonWarmed(): Promise<{ available: boolean; pythonVersion: string }> {
-  if (cachedCPythonWarmInfo && cachedCPythonWarmInfo.available) {
-    return { available: true, pythonVersion: cachedCPythonWarmInfo.pythonVersion };
-  }
-  if (inflightCPythonWarm) return inflightCPythonWarm;
-
-  inflightCPythonWarm = new Promise<{ available: boolean; pythonVersion: string }>((resolve) => {
-    const proc = spawn(
-      'python3',
-      ['-c', 'import sys, math, json, os, random, datetime, platform, re; print(sys.version.split()[0])'],
-      { stdio: ['ignore', 'pipe', 'pipe'] }
-    );
-    let out = '';
-    const timer = setTimeout(() => {
-      try {
-        proc.kill('SIGKILL');
-      } catch {}
-      resolve({ available: false, pythonVersion: '' });
-    }, 6000);
-
-    proc.stdout.on('data', (d) => {
-      out += d.toString();
-    });
-    proc.on('close', (code) => {
-      clearTimeout(timer);
-      const version = out.trim();
-      const available = code === 0 && version.length > 0;
-      if (available) {
-        cachedCPythonWarmInfo = { available: true, pythonVersion: version, warmedAt: Date.now() };
-      }
-      resolve({ available, pythonVersion: version });
-    });
-    proc.on('error', () => {
-      clearTimeout(timer);
-      resolve({ available: false, pythonVersion: '' });
-    });
-  }).finally(() => {
-    inflightCPythonWarm = null;
-  });
-
-  return inflightCPythonWarm;
-}
-
-// Endpoint: Pre-warm CPython binary & common stdlib modules for low-latency first run / engine switch
-app.all('/api/python/warmup', async (req, res) => {
-  if (req.method !== 'GET' && req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed' });
-  }
-  const startedAt = Date.now();
-  const info = await ensureCPythonWarmed();
-  return res.json({
-    ok: info.available,
-    available: info.available,
-    pythonVersion: info.pythonVersion || null,
-    warmed: info.available,
-    durationMs: Date.now() - startedAt,
-  });
-});
-
 // Endpoint: CPython Native Execution on Linux Server
 app.post('/api/python/run', async (req, res) => {
   const { code, inputs = [] } = req.body;
@@ -1079,17 +895,13 @@ app.post('/api/python/run', async (req, res) => {
     const startTime = Date.now();
     let stdoutData = '';
     let stderrData = '';
-    let stderrLineBuffer = '';
-    let isWaitingInputSentinel = false;
-    let capturedPlots: string[] = [];
-    let clientDisconnected = false;
 
     // Smart Python runner script:
     // 1. Hooks builtins.input() to echo typed inputs into stdout (matching interactive terminal behavior)
-    // 2. Intercepts uncaught EOFError cleanly without printing raw traceback red error to terminal
-    // 3. Captures matplotlib figures (if imported) as base64 PNGs
+    // 2. Preserves exact line numbers in user code traceback
+    // 3. Flushes output immediately on EOF so prompt text is captured
     const runnerScript = `
-import sys, builtins, json
+import sys, builtins
 _orig_input = builtins.input
 def _pydroid_input(prompt=""):
     try:
@@ -1102,45 +914,12 @@ def _pydroid_input(prompt=""):
         raise
 builtins.input = _pydroid_input
 
-if "matplotlib" in sys.modules or "matplotlib" in open(sys.argv[1], "r", encoding="utf-8").read():
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        plt.show = lambda *a, **kw: None
-    except Exception:
-        pass
-
 target = sys.argv[1]
 sys.argv = [target]
 with open(target, "r", encoding="utf-8") as f:
     source = f.read()
-
-try:
-    code_obj = compile(source, target, "exec")
-    exec(code_obj, {"__name__": "__main__", "__file__": target})
-except EOFError:
-    sys.stdout.flush()
-    sys.stderr.write("\\n__PYDROID_EOF_INPUT__\\n")
-    sys.stderr.flush()
-finally:
-    if "matplotlib.pyplot" in sys.modules:
-        try:
-            import io, base64
-            import matplotlib.pyplot as plt
-            plots = []
-            for fig_num in plt.get_fignums():
-                fig = plt.figure(fig_num)
-                buf = io.BytesIO()
-                fig.savefig(buf, format="png", bbox_inches="tight", dpi=120)
-                buf.seek(0)
-                plots.append(base64.b64encode(buf.read()).decode("utf-8"))
-                plt.close(fig)
-            if plots:
-                sys.stderr.write("\\n__PYDROID_PLOTS_B64__:" + json.dumps(plots) + "\\n")
-                sys.stderr.flush()
-        except Exception:
-            pass
+code_obj = compile(source, target, "exec")
+exec(code_obj, {"__name__": "__main__", "__file__": target})
 `;
 
     const isStreaming = req.headers.accept?.includes('text/event-stream') || req.query.stream === 'true';
@@ -1149,26 +928,11 @@ finally:
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
-      res.setHeader('X-Accel-Buffering', 'no');
       res.flushHeaders?.();
     }
 
-    const pyBin = getPythonBinary();
-    const pyProcess = spawn(pyBin, ['-u', '-c', runnerScript, filePath], {
-      timeout: 20000,
-      env: {
-        ...process.env,
-        PYTHONIOENCODING: 'utf-8',
-        PYTHONUNBUFFERED: '1',
-        MPLBACKEND: 'Agg',
-      },
-    });
-
-    req.on('close', () => {
-      clientDisconnected = true;
-      if (!pyProcess.killed) {
-        pyProcess.kill('SIGTERM');
-      }
+    const pyProcess = spawn('python3', ['-u', '-c', runnerScript, filePath], {
+      timeout: 15000, // 15 second safety timeout
     });
 
     // Provide standard input if passed (for input() prompts)
@@ -1179,34 +943,10 @@ finally:
       pyProcess.stdin.end();
     }
 
-    const processStderrLine = (line: string) => {
-      const trimmed = line.trim();
-      if (trimmed === '__PYDROID_EOF_INPUT__') {
-        isWaitingInputSentinel = true;
-        return;
-      }
-      if (trimmed.startsWith('__PYDROID_PLOTS_B64__:')) {
-        try {
-          const parsed = JSON.parse(trimmed.slice('__PYDROID_PLOTS_B64__:'.length));
-          if (Array.isArray(parsed)) {
-            capturedPlots = parsed;
-          }
-        } catch {
-          // ignore malformed plots payload
-        }
-        return;
-      }
-      const chunkWithNewline = line + '\n';
-      stderrData += chunkWithNewline;
-      if (isStreaming && !clientDisconnected && trimmed) {
-        res.write(`data: ${JSON.stringify({ type: 'stderr', chunk: chunkWithNewline })}\n\n`);
-      }
-    };
-
     pyProcess.stdout.on('data', (data) => {
-      const chunkStr = data.toString('utf-8');
+      const chunkStr = data.toString();
       stdoutData += chunkStr;
-      if (isStreaming && !clientDisconnected) {
+      if (isStreaming) {
         res.write(`data: ${JSON.stringify({ type: 'stdout', chunk: chunkStr })}\n\n`);
       }
       if (stdoutData.length > 500000) {
@@ -1215,11 +955,10 @@ finally:
     });
 
     pyProcess.stderr.on('data', (data) => {
-      stderrLineBuffer += data.toString('utf-8');
-      const lines = stderrLineBuffer.split('\n');
-      stderrLineBuffer = lines.pop() || '';
-      for (const line of lines) {
-        processStderrLine(line);
+      const chunkStr = data.toString();
+      stderrData += chunkStr;
+      if (isStreaming) {
+        res.write(`data: ${JSON.stringify({ type: 'stderr', chunk: chunkStr })}\n\n`);
       }
       if (stderrData.length > 500000) {
         pyProcess.kill();
@@ -1227,27 +966,20 @@ finally:
     });
 
     pyProcess.on('close', async (exitCode) => {
-      if (stderrLineBuffer) {
-        processStderrLine(stderrLineBuffer);
-        stderrLineBuffer = '';
-      }
-
       const duration = Date.now() - startTime;
       try {
         await fs.promises.unlink(filePath);
-      } catch {
+      } catch (e) {
         // ignore cleanup error
       }
 
-      if (clientDisconnected) {
-        return;
-      }
-
-      const isWaitingInput =
-        isWaitingInputSentinel || stderrData.includes('EOFError: EOF when reading a line');
+      // Detect if Python process ended due to waiting for user input()
+      const isWaitingInput = stderrData.includes('EOFError: EOF when reading a line');
 
       if (isWaitingInput) {
-        const stdoutLines = stdoutData.replace(/\r/g, '').split('\n');
+        // The program is simply waiting for the user to provide next input()
+        // Extract prompt line from stdout if available
+        const stdoutLines = stdoutData.split('\n');
         const lastLine = stdoutLines[stdoutLines.length - 1] || 'input():';
 
         const payload = {
@@ -1255,9 +987,8 @@ finally:
           isWaitingInput: true,
           exitCode: 0,
           stdout: stdoutData,
-          stderr: '',
+          stderr: '', // Do NOT return EOFError traceback to avoid triggering false alarms
           prompt: lastLine.trim() || 'input():',
-          plotImages: capturedPlots,
           duration,
           engine: 'CPython 3.10 (Native Linux)',
         };
@@ -1269,7 +1000,7 @@ finally:
         return res.json(payload);
       }
 
-      // Clean up runner wrapper frames and tmp paths from genuine errors
+      // For genuine syntax/runtime errors: clean up runner wrapper frames and tmp paths from stderr
       let cleanedStderr = stderrData;
       if (filePath) {
         cleanedStderr = cleanedStderr.split(filePath).join('main.py');
@@ -1287,7 +1018,6 @@ finally:
         exitCode,
         stdout: stdoutData,
         stderr: cleanedStderr.trim(),
-        plotImages: capturedPlots,
         duration,
         engine: 'CPython 3.10 (Native Linux)',
       };
@@ -1302,8 +1032,7 @@ finally:
     pyProcess.on('error', async (err) => {
       try {
         await fs.promises.unlink(filePath);
-      } catch {}
-      if (clientDisconnected) return;
+      } catch (e) {}
       if (isStreaming) {
         res.write(`data: ${JSON.stringify({ type: 'error', error: `Lỗi khởi động CPython: ${err.message}` })}\n\n`);
         return res.end();
@@ -1318,7 +1047,7 @@ finally:
       if (fs.existsSync(filePath)) {
         await fs.promises.unlink(filePath);
       }
-    } catch {}
+    } catch (e) {}
     return res.status(500).json({ error: err.message || 'Lỗi thực thi mã Python' });
   }
 });
