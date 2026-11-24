@@ -1,12 +1,5 @@
 import React, { useRef, useState, useImperativeHandle, forwardRef, useMemo } from 'react';
-import {
-  FileCode,
-  Plus,
-  X,
-  Search,
-  Check,
-  Copy,
-} from 'lucide-react';
+import { X } from 'lucide-react';
 import { CodeFile } from '../types';
 import { SyntaxTheme } from '../types/theme';
 
@@ -14,16 +7,13 @@ export interface EditorHandle {
   insertTextAtCursor: (text: string, cursorOffset?: number) => void;
   indentSelection: () => void;
   unindentSelection: () => void;
+  openSearch: () => void;
   getText: () => string;
   setText: (newText: string) => void;
 }
 
 interface EditorProps {
-  files: CodeFile[];
-  activeFileId: string;
-  onSelectFile: (id: string) => void;
-  onAddFile: () => void;
-  onCloseFile: (id: string) => void;
+  activeFile: CodeFile;
   onChangeContent: (content: string) => void;
   highlightLine?: number;
   fontSize: number;
@@ -208,11 +198,7 @@ function highlightPythonLine(line: string, theme: SyntaxTheme, inDocstring: bool
 export const Editor = forwardRef<EditorHandle, EditorProps>(
   (
     {
-      files,
-      activeFileId,
-      onSelectFile,
-      onAddFile,
-      onCloseFile,
+      activeFile,
       onChangeContent,
       highlightLine,
       fontSize,
@@ -220,7 +206,6 @@ export const Editor = forwardRef<EditorHandle, EditorProps>(
     },
     ref
   ) => {
-    const activeFile = files.find((f) => f.id === activeFileId) || files[0];
     const textareaRef = useRef<HTMLTextAreaElement>(null);
     const lineNumbersRef = useRef<HTMLDivElement>(null);
     const backdropRef = useRef<HTMLDivElement>(null);
@@ -229,7 +214,6 @@ export const Editor = forwardRef<EditorHandle, EditorProps>(
     const [showSearch, setShowSearch] = useState(false);
     const [searchQuery, setSearchQuery] = useState('');
     const [replaceQuery, setReplaceQuery] = useState('');
-    const [copied, setCopied] = useState(false);
 
     // Sync scroll
     const handleScroll = () => {
@@ -258,6 +242,12 @@ export const Editor = forwardRef<EditorHandle, EditorProps>(
     const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
       const textarea = textareaRef.current;
       if (!textarea) return;
+
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f') {
+        e.preventDefault();
+        setShowSearch((prev) => !prev);
+        return;
+      }
 
       if (e.key === 'Tab') {
         e.preventDefault();
@@ -374,6 +364,7 @@ export const Editor = forwardRef<EditorHandle, EditorProps>(
         }
       },
 
+      openSearch: () => setShowSearch(true),
       getText: () => activeFile?.content || '',
       setText: (newText: string) => onChangeContent(newText),
     }));
@@ -395,12 +386,6 @@ export const Editor = forwardRef<EditorHandle, EditorProps>(
       });
     }, [activeFile?.content, theme]);
 
-    const handleCopyAll = () => {
-      navigator.clipboard.writeText(activeFile?.content || '');
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    };
-
     const handleReplace = () => {
       if (!searchQuery) return;
       const updated = (activeFile?.content || '').replaceAll(
@@ -415,91 +400,27 @@ export const Editor = forwardRef<EditorHandle, EditorProps>(
         className="flex-1 flex flex-col h-full overflow-hidden select-none"
         style={{ backgroundColor: theme.background }}
       >
-        {/* File Tabs & Editor Controls */}
-        <div className="flex items-center justify-between bg-[#131620] border-b border-slate-800/80 px-2 pt-1 shrink-0 select-none">
-          <div className="flex items-center space-x-1 overflow-x-auto no-scrollbar max-w-[70vw]">
-            {files.map((file) => {
-              const isActive = file.id === activeFileId;
-              return (
-                <div
-                  key={file.id}
-                  onClick={() => onSelectFile(file.id)}
-                  className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-t-lg text-xs font-mono cursor-pointer transition-all border-t-2 ${
-                    isActive
-                      ? 'bg-[#181d28] text-amber-300 font-bold border-amber-400 shadow-sm'
-                      : 'bg-[#151822] text-slate-400 hover:text-slate-200 border-transparent hover:bg-[#1a1f2c]'
-                  }`}
-                >
-                  <FileCode className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-                  <span className="truncate max-w-[110px]">{file.name}</span>
-                  {files.length > 1 && (
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onCloseFile(file.id);
-                      }}
-                      className="p-0.5 hover:text-rose-400 rounded transition"
-                    >
-                      <X className="w-3 h-3" />
-                    </button>
-                  )}
-                </div>
-              );
-            })}
-
-            <button
-              onClick={onAddFile}
-              title="Thêm file mới (.py)"
-              className="p-1 rounded hover:bg-slate-800 text-slate-400 hover:text-white transition"
-            >
-              <Plus className="w-3.5 h-3.5" />
-            </button>
-          </div>
-
-          <div className="flex items-center space-x-1 text-slate-400 pb-1">
-            <button
-              onClick={() => setShowSearch(!showSearch)}
-              title="Tìm kiếm & Thay thế"
-              className={`p-1.5 rounded hover:bg-slate-800 transition ${
-                showSearch ? 'text-amber-400 bg-slate-800' : ''
-              }`}
-            >
-              <Search className="w-3.5 h-3.5" />
-            </button>
-            <button
-              onClick={handleCopyAll}
-              title="Sao chép toàn bộ mã nguồn"
-              className="p-1.5 rounded hover:bg-slate-800 transition"
-            >
-              {copied ? (
-                <Check className="w-3.5 h-3.5 text-emerald-400" />
-              ) : (
-                <Copy className="w-3.5 h-3.5" />
-              )}
-            </button>
-          </div>
-        </div>
 
         {/* Search & Replace Floating Bar */}
         {showSearch && (
-          <div className="bg-[#1b202c] border-b border-slate-700/70 p-2 flex flex-wrap items-center gap-2 text-xs">
+          <div className="bg-[#0b1324] border-b border-cyan-950/70 p-2 flex flex-wrap items-center gap-2 text-xs">
             <input
               type="text"
               placeholder="Tìm kiếm..."
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              className="bg-[#0e1117] border border-slate-700 rounded px-2.5 py-1 text-slate-200 focus:outline-none focus:border-amber-400 font-mono text-xs"
+              className="bg-[#070b14] border border-slate-700 rounded-lg px-2.5 py-1 text-slate-200 focus:outline-none focus:border-cyan-400 font-mono text-xs"
             />
             <input
               type="text"
               placeholder="Thay thế bằng..."
               value={replaceQuery}
               onChange={(e) => setReplaceQuery(e.target.value)}
-              className="bg-[#0e1117] border border-slate-700 rounded px-2.5 py-1 text-slate-200 focus:outline-none focus:border-amber-400 font-mono text-xs"
+              className="bg-[#070b14] border border-slate-700 rounded-lg px-2.5 py-1 text-slate-200 focus:outline-none focus:border-cyan-400 font-mono text-xs"
             />
             <button
               onClick={handleReplace}
-              className="px-2.5 py-1 bg-amber-400 hover:bg-amber-300 text-slate-950 font-bold rounded transition"
+              className="px-2.5 py-1 bg-amber-400 hover:bg-amber-300 text-slate-950 font-bold rounded-lg transition"
             >
               Thay thế
             </button>
@@ -514,10 +435,10 @@ export const Editor = forwardRef<EditorHandle, EditorProps>(
 
         {/* Editor Main Canvas (Line Numbers + Highlighted Textarea) */}
         <div className="flex-1 flex overflow-hidden relative">
-          {/* Line Numbers Bar (Screenshot 2: Yellow line numbers) */}
+          {/* Line Numbers Bar: muted gray on Dark Premium gutter so code syntax takes primary visual focus */}
           <div
             ref={lineNumbersRef}
-            className="w-12 bg-[#0e1017] text-amber-400 font-bold select-none py-3 pr-2.5 text-right font-mono border-r border-slate-800/80 overflow-hidden shrink-0"
+            className="w-11 bg-[#080d17] text-slate-600 font-normal tabular-nums select-none py-3 pr-2.5 text-right font-mono border-r border-cyan-950/60 overflow-hidden shrink-0"
             style={{ fontSize: `${fontSize}px`, lineHeight: '1.6' }}
           >
             {Array.from({ length: Math.max(totalLines, 1) }).map((_, i) => {
@@ -528,8 +449,8 @@ export const Editor = forwardRef<EditorHandle, EditorProps>(
                   key={lineNum}
                   className={`transition-colors ${
                     isErrorLine
-                      ? 'text-rose-400 bg-rose-500/20 rounded px-1'
-                      : 'text-amber-400'
+                      ? 'text-rose-400 bg-rose-500/20 font-semibold rounded px-1'
+                      : 'text-slate-600'
                   }`}
                 >
                   {lineNum}
@@ -579,18 +500,18 @@ export const Editor = forwardRef<EditorHandle, EditorProps>(
         </div>
 
         {/* Editor Status Bar */}
-        <div className="bg-[#0f1118] border-t border-slate-800/80 px-3 py-1 text-[11px] text-slate-400 flex items-center justify-between select-none shrink-0 font-mono">
-          <div className="flex items-center space-x-3">
-            <span className="text-amber-400 font-bold">
+        <div className="bg-[#090e1a] border-t border-cyan-950/60 px-3 py-1 text-[11px] text-slate-400 flex items-center justify-between select-none shrink-0 font-mono">
+          <div className="flex items-center space-x-2.5 min-w-0">
+            <span className="text-slate-300 truncate max-w-[120px]">{activeFile?.name || 'main.py'}</span>
+            <span className="text-slate-600">•</span>
+            <span className="text-amber-400/90 tabular-nums">
               Ln {cursorPos.line}, Col {cursorPos.col}
             </span>
-            <span>{totalLines} dòng</span>
           </div>
-          <div className="flex items-center space-x-2">
-            <span>UTF-8</span>
-            <span className="px-1.5 py-0.2 rounded bg-slate-800 text-amber-400 text-[10px] font-bold">
-              Python 3.10
-            </span>
+          <div className="flex items-center space-x-2 shrink-0 text-slate-500">
+            <span>{totalLines} dòng</span>
+            <span>•</span>
+            <span className="text-cyan-400/80">Python 3.11</span>
           </div>
         </div>
       </div>

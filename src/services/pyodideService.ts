@@ -291,6 +291,69 @@ def _custom_input(prompt=""):
 
 builtins.input = _custom_input
 
+# Transform top-level time.sleep calls to await asyncio.sleep to prevent freezing browser main thread
+import ast
+def _pydroid_transform_sleep(src):
+    try:
+        tree = ast.parse(src)
+        has_asyncio = False
+        has_sleep_calls = False
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name == 'asyncio':
+                        has_asyncio = True
+
+        class _SleepToAwait(ast.NodeTransformer):
+            def __init__(self):
+                self.in_sync_func = False
+            def visit_FunctionDef(self, node):
+                old = self.in_sync_func
+                self.in_sync_func = True
+                self.generic_visit(node)
+                self.in_sync_func = old
+                return node
+            def visit_AsyncFunctionDef(self, node):
+                old = self.in_sync_func
+                self.in_sync_func = True
+                self.generic_visit(node)
+                self.in_sync_func = old
+                return node
+            def visit_Call(self, node):
+                nonlocal has_sleep_calls
+                self.generic_visit(node)
+                if self.in_sync_func:
+                    return node
+                is_sleep = False
+                if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name) and node.func.value.id == 'time' and node.func.attr == 'sleep':
+                    is_sleep = True
+                elif isinstance(node.func, ast.Name) and node.func.id == 'sleep':
+                    is_sleep = True
+                if is_sleep:
+                    has_sleep_calls = True
+                    return ast.Await(
+                        value=ast.Call(
+                            func=ast.Attribute(
+                                value=ast.Name(id='asyncio', ctx=ast.Load()),
+                                attr='sleep',
+                                ctx=ast.Load()
+                            ),
+                            args=node.args,
+                            keywords=node.keywords
+                        )
+                    )
+                return node
+
+        new_tree = _SleepToAwait().visit(tree)
+        if has_sleep_calls:
+            if not has_asyncio:
+                new_tree.body.insert(0, ast.Import(names=[ast.alias(name='asyncio', asname=None)]))
+            ast.fix_missing_locations(new_tree)
+            return ast.unparse(new_tree)
+        return src
+    except Exception:
+        return src
+
 # Hook Matplotlib backend if available
 try:
     import matplotlib
@@ -317,28 +380,45 @@ except ImportError:
       installedPackages.add('pandas');
     }
 
-    // Execute user code
-    await pyodide.runPythonAsync(code);
+    // Transform time.sleep to non-blocking asyncio.sleep if code contains sleep
+    let runnableCode = code;
+    if (code.includes('sleep')) {
+      try {
+        const transformed = pyodide.runPython(`_pydroid_transform_sleep(${JSON.stringify(code)})`);
+        if (transformed && typeof transformed === 'string') {
+          runnableCode = transformed;
+        }
+      } catch (e) {
+        runnableCode = code;
+      }
+    }
 
-    // Check for rendered matplotlib plots
-    const plotCaptureScript = `
-import json
+    // Execute user code
+    await pyodide.runPythonAsync(runnableCode);
+
+    // Check for rendered matplotlib plots only if matplotlib was used
+    let plotsJson = '[]';
+    if (code.includes('matplotlib') || code.includes('plt.')) {
+      const plotCaptureScript = `
+import sys, json
 _captured_plots = []
-try:
-    import matplotlib.pyplot as plt
-    import io, base64
-    for fig_num in plt.get_fignums():
-        fig = plt.figure(fig_num)
-        buf = io.BytesIO()
-        fig.savefig(buf, format='png', bbox_inches='tight', dpi=120)
-        buf.seek(0)
-        _captured_plots.append(base64.b64encode(buf.read()).decode('utf-8'))
-        plt.close(fig)
-except Exception as e:
-    pass
+if 'matplotlib.pyplot' in sys.modules:
+    try:
+        import matplotlib.pyplot as plt
+        import io, base64
+        for fig_num in plt.get_fignums():
+            fig = plt.figure(fig_num)
+            buf = io.BytesIO()
+            fig.savefig(buf, format='png', bbox_inches='tight', dpi=120)
+            buf.seek(0)
+            _captured_plots.append(base64.b64encode(buf.read()).decode('utf-8'))
+            plt.close(fig)
+    except Exception:
+        pass
 json.dumps(_captured_plots)
 `;
-    const plotsJson = await pyodide.runPythonAsync(plotCaptureScript);
+      plotsJson = await pyodide.runPythonAsync(plotCaptureScript);
+    }
     try {
       plotImages = JSON.parse(plotsJson);
     } catch (e) {

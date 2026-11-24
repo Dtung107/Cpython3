@@ -10,13 +10,32 @@ import { PipManagerModal } from './components/PipManagerModal';
 import { ApkBuilderModal } from './components/ApkBuilderModal';
 import { SampleCodesModal } from './components/SampleCodesModal';
 import { DrawerMenu } from './components/DrawerMenu';
+import { FileManagerModal } from './components/FileManagerModal';
 import { SettingsApiKeyModal } from './components/SettingsApiKeyModal';
+import { GoogleWorkspaceModal } from './components/GoogleWorkspaceModal';
+import { ApkGoogleAuthBridge } from './components/ApkGoogleAuthBridge';
 import { CodeFile, EngineType, ExecutionResult, AIDebugResult } from './types';
 import { SyntaxTheme, DEFAULT_SYNTAX_THEME } from './types/theme';
-import { ShortcutKey, KeySize, DEFAULT_SHORTCUTS } from './types/shortcuts';
+import {
+  ShortcutKey,
+  KeySize,
+  DEFAULT_SHORTCUTS,
+  migrateLegacyPairedShortcuts,
+} from './types/shortcuts';
 import { runPyodideCode, installPyodidePackage, getInstalledPackagesList } from './services/pyodideService';
 import { runCPythonCode } from './services/cpythonService';
-import { requestAIDebug, requestAIExplain } from './services/geminiService';
+import {
+  requestAIDebugStream,
+  requestAIExplainStream,
+  checkAIServerStatus,
+} from './services/geminiService';
+import {
+  initGoogleAuth,
+  getAccessToken,
+  googleSignIn,
+  WorkspaceSyncPayload,
+} from './services/googleWorkspaceService';
+import { User } from 'firebase/auth';
 import { isMobileOrApk, hasCustomServer } from './utils/apiConfig';
 
 const DEFAULT_MAIN_PY = `# =========================================================
@@ -43,12 +62,24 @@ thong_diep = chao_mung(ten if ten.strip() else "Lập Trình Viên")
 print(thong_diep)
 
 print("-" * 48)
-print("💡 Mẹo: Nhấn nút đỏ có hình con bọ để AI Debugger phân tích lỗi tức thì.")
-print("🎨 Nhấn nút cài đặt cam > Tô Màu Văn Bản để tùy chỉnh màu cú pháp.")
-print("🎚️ Nhấn nút thanh trượt góc phải bàn phím để tùy biến phím tắt kéo thả!")
+print("💡 Mẹo: Nhấn nút AI góc phải để AI Debugger phân tích lỗi tức thì.")
+print("🎨 Mở Menu (3 gạch) > Cỡ Chữ Trình Soạn Thảo > Tô Màu Văn Bản để tùy chỉnh màu cú pháp.")
+print("📁 Nhấn biểu tượng Thư mục cạnh Thùng rác để tạo, đổi tên, lưu và quản lý tệp .py!")
 `;
 
 export default function App() {
+  const isApkAuthBridge =
+    typeof window !== 'undefined' &&
+    new URLSearchParams(window.location.search).get('apk_auth') === '1';
+
+  if (isApkAuthBridge) {
+    return <ApkGoogleAuthBridge />;
+  }
+
+  return <MainIDEApp />;
+}
+
+function MainIDEApp() {
   // File state
   const [files, setFiles] = useState<CodeFile[]>(() => {
     const saved = localStorage.getItem('pydroid_files');
@@ -94,18 +125,18 @@ export default function App() {
   });
   const [syntaxModalOpen, setSyntaxModalOpen] = useState(false);
 
-  // Keyboard Shortcuts & Size state (Screenshot 4)
+  // Keyboard Shortcuts & Size state (Dark Premium Mobile Bar)
   const [shortcuts, setShortcuts] = useState<ShortcutKey[]>(() => {
     const saved = localStorage.getItem('pydroid_shortcuts');
     if (saved) {
       try {
-        return JSON.parse(saved);
+        return migrateLegacyPairedShortcuts(JSON.parse(saved));
       } catch (e) {}
     }
     return DEFAULT_SHORTCUTS;
   });
   const [keySize, setKeySize] = useState<KeySize>(() => {
-    return (localStorage.getItem('pydroid_keysize') as KeySize) || 'medium';
+    return (localStorage.getItem('pydroid_keysize') as KeySize) || 'large';
   });
   const [shortcutConfigOpen, setShortcutConfigOpen] = useState(false);
 
@@ -126,6 +157,9 @@ export default function App() {
   const [aiExplaining, setAiExplaining] = useState(false);
 
   // Workspace Modals
+  const [fileManagerOpen, setFileManagerOpen] = useState(false);
+  const [confirmClearEditorOpen, setConfirmClearEditorOpen] = useState(false);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [pipModalOpen, setPipModalOpen] = useState(false);
   const [installedPackages, setInstalledPackages] = useState<string[]>([]);
   const [isInstallingPip, setIsInstallingPip] = useState(false);
@@ -133,9 +167,54 @@ export default function App() {
   const [apkModalOpen, setApkModalOpen] = useState(false);
   const [samplesModalOpen, setSamplesModalOpen] = useState(false);
   const [apiKeyModalOpen, setApiKeyModalOpen] = useState(false);
+  const [googleModalOpen, setGoogleModalOpen] = useState(false);
 
-  // Editor ref
+  const showToast = (msg: string) => {
+    setToastMessage(msg);
+    setTimeout(() => {
+      setToastMessage((prev) => (prev === msg ? null : prev));
+    }, 2600);
+  };
+
+  // Google Account & Workspace Auth state
+  const [googleUser, setGoogleUser] = useState<User | null>(null);
+  const [hasGoogleToken, setHasGoogleToken] = useState(false);
+
+  // AI Server Status Indicator state (Requirement 9)
+  const [aiStatus, setAiStatus] = useState<'online' | 'offline' | 'checking'>('checking');
+  const [aiStatusTooltip, setAiStatusTooltip] = useState<string>('Đang kiểm tra kết nối AI...');
+
+  const handleCheckAiStatus = async () => {
+    setAiStatus('checking');
+    try {
+      const res = await checkAIServerStatus();
+      setAiStatus(res.online ? 'online' : 'offline');
+      setAiStatusTooltip(res.message);
+    } catch (e: any) {
+      setAiStatus('offline');
+      setAiStatusTooltip('Không thể kết nối đến máy chủ AI');
+    }
+  };
+
+  useEffect(() => {
+    handleCheckAiStatus();
+    const unsubscribe = initGoogleAuth(
+      (user, token) => {
+        setGoogleUser(user);
+        setHasGoogleToken(!!token);
+      },
+      (user) => {
+        setGoogleUser(user);
+        setHasGoogleToken(!!getAccessToken());
+      }
+    );
+    return () => unsubscribe();
+  }, []);
+
+  // Editor & AI stream abort refs
   const editorRef = useRef<EditorHandle>(null);
+  const debugAbortRef = useRef<AbortController | null>(null);
+  const explainAbortRef = useRef<AbortController | null>(null);
 
   const activeFile = files.find((f) => f.id === activeFileId) || files[0];
 
@@ -146,6 +225,16 @@ export default function App() {
         localStorage.setItem('pydroid_cloud_server_url', window.location.origin);
       }
     }
+
+    // Configure Capacitor Android StatusBar so the top toolbar never overlaps system icons
+    try {
+      const statusBar = (window as any).Capacitor?.Plugins?.StatusBar;
+      if (statusBar) {
+        statusBar.setOverlaysWebView?.({ overlay: false }).catch?.(() => {});
+        statusBar.setBackgroundColor?.({ color: '#070b14' }).catch?.(() => {});
+        statusBar.setStyle?.({ style: 'DARK' }).catch?.(() => {});
+      }
+    } catch (e) {}
   }, []);
 
   useEffect(() => {
@@ -180,10 +269,10 @@ export default function App() {
     );
   };
 
-  const handleAddFile = () => {
-    const filename = prompt('Nhập tên file mới (ví dụ: utils.py):');
-    if (!filename) return;
-    const finalName = filename.endsWith('.py') ? filename : `${filename}.py`;
+  const handleCreateFile = (filename: string) => {
+    const trimmed = filename.trim();
+    if (!trimmed) return;
+    const finalName = trimmed.endsWith('.py') ? trimmed : `${trimmed}.py`;
     const newFile: CodeFile = {
       id: Date.now().toString(),
       name: finalName,
@@ -191,6 +280,14 @@ export default function App() {
     };
     setFiles((prev) => [...prev, newFile]);
     setActiveFileId(newFile.id);
+    setViewMode('editor');
+  };
+
+  const handleRenameFile = (id: string, newName: string) => {
+    const trimmed = newName.trim();
+    if (!trimmed) return;
+    const finalName = trimmed.endsWith('.py') ? trimmed : `${trimmed}.py`;
+    setFiles((prev) => prev.map((f) => (f.id === id ? { ...f, name: finalName } : f)));
   };
 
   const handleCloseFile = (id: string) => {
@@ -202,7 +299,43 @@ export default function App() {
     }
   };
 
-  // Run Code logic (CPython Native or Pyodide WASM) with Multi-input support
+  const handleOpenFileFromDrive = (fileName: string, content: string) => {
+    const existing = files.find((f) => f.name === fileName);
+    if (existing) {
+      setFiles((prev) =>
+        prev.map((f) => (f.id === existing.id ? { ...f, content, isModified: false } : f))
+      );
+      setActiveFileId(existing.id);
+    } else {
+      const newFile: CodeFile = {
+        id: Date.now().toString(),
+        name: fileName,
+        content,
+      };
+      setFiles((prev) => [...prev, newFile]);
+      setActiveFileId(newFile.id);
+    }
+    setHighlightLine(undefined);
+    setViewMode('editor');
+  };
+
+  const handleApplySyncedWorkspace = (payload: WorkspaceSyncPayload) => {
+    if (payload.files && payload.files.length > 0) {
+      setFiles(payload.files);
+      const targetId = payload.files.some((f) => f.id === payload.activeFileId)
+        ? payload.activeFileId
+        : payload.files[0].id;
+      setActiveFileId(targetId);
+    }
+    if (payload.syntaxTheme) setSyntaxTheme(payload.syntaxTheme);
+    if (payload.shortcuts) setShortcuts(payload.shortcuts);
+    if (payload.keySize) setKeySize(payload.keySize);
+    if (typeof payload.fontSize === 'number') setFontSize(payload.fontSize);
+    setHighlightLine(undefined);
+    setViewMode('editor');
+  };
+
+  // Run Code logic (CPython Native or Pyodide WASM) with Real-Time Streaming & Multi-input support
   const handleRunCode = async (customInputs?: string[], isFresh = false) => {
     if (isRunning) return;
 
@@ -226,12 +359,57 @@ export default function App() {
         : (preloadedStdin.trim() ? preloadedStdin.split('\n') : []);
     }
 
+    const defaultEngineName = engine === 'cpython' ? 'CPython 3.10 (Native Linux)' : 'Pyodide WASM (Offline)';
+    let currentStdout = isFresh ? '' : (executionResult?.stdout || '');
+    let currentStderr = '';
+
+    if (isFresh) {
+      setExecutionResult({
+        stdout: '',
+        stderr: '',
+        exitCode: 0,
+        duration: 0,
+        engine: defaultEngineName,
+        plotImages: [],
+        isWaitingInput: false,
+      });
+    }
+
+    // Real-time live streaming callbacks: updates Terminal immediately on every print() or chunk
+    const handleLiveStdout = (chunk: string) => {
+      currentStdout += chunk;
+      setExecutionResult((prev) => ({
+        stdout: currentStdout,
+        stderr: currentStderr || prev?.stderr || '',
+        exitCode: 0,
+        duration: prev?.duration || 0,
+        engine: prev?.engine || defaultEngineName,
+        plotImages: prev?.plotImages || [],
+        isWaitingInput: false,
+      }));
+    };
+
+    const handleLiveStderr = (chunk: string) => {
+      currentStderr += chunk;
+      setExecutionResult((prev) => ({
+        stdout: currentStdout,
+        stderr: currentStderr,
+        exitCode: 1,
+        duration: prev?.duration || 0,
+        engine: prev?.engine || defaultEngineName,
+        plotImages: prev?.plotImages || [],
+        isWaitingInput: false,
+      }));
+    };
+
     try {
       if (engine === 'cpython') {
         if (isMobileOrApk() && !hasCustomServer()) {
           const wasmRes = await runPyodideCode({
             code,
             inputs: inputsToProvide,
+            onStdout: handleLiveStdout,
+            onStderr: handleLiveStderr,
           });
           setExecutionResult({
             stdout: wasmRes.stdout,
@@ -249,7 +427,12 @@ export default function App() {
           }
         } else {
           try {
-            const res = await runCPythonCode({ code, inputs: inputsToProvide });
+            const res = await runCPythonCode({
+              code,
+              inputs: inputsToProvide,
+              onStdout: handleLiveStdout,
+              onStderr: handleLiveStderr,
+            });
             setExecutionResult({
               stdout: res.stdout,
               stderr: res.stderr,
@@ -268,6 +451,8 @@ export default function App() {
             const wasmRes = await runPyodideCode({
               code,
               inputs: inputsToProvide,
+              onStdout: handleLiveStdout,
+              onStderr: handleLiveStderr,
             });
             setExecutionResult({
               stdout: wasmRes.stdout,
@@ -289,6 +474,8 @@ export default function App() {
         const wasmRes = await runPyodideCode({
           code,
           inputs: inputsToProvide,
+          onStdout: handleLiveStdout,
+          onStderr: handleLiveStderr,
         });
         setExecutionResult({
           stdout: wasmRes.stdout,
@@ -307,7 +494,7 @@ export default function App() {
       }
     } catch (err: any) {
       setExecutionResult({
-        stdout: '',
+        stdout: currentStdout,
         stderr: err?.message || String(err),
         exitCode: 1,
         duration: 0,
@@ -340,26 +527,45 @@ export default function App() {
     setAiAssistantTab(tab);
     setAiAssistantOpen(true);
     if (tab === 'debug') {
-      handleRunAIDebug();
-    } else if (tab === 'explain' && !aiExplainText) {
-      handleAskAIExplain();
+      void handleRunAIDebug(false);
+    } else if (tab === 'explain') {
+      void handleAskAIExplain(false);
     }
   };
 
-  const handleRunAIDebug = async () => {
+  const handleRunAIDebug = async (forceRefresh = false) => {
+    debugAbortRef.current?.abort();
+    const controller = new AbortController();
+    debugAbortRef.current = controller;
+
     setAiLoading(true);
+    setAiDebugResult(null);
 
     try {
       const code = activeFile?.content || '';
       const errorOutput = executionResult?.stderr || '';
 
-      const debugData = await requestAIDebug(code, errorOutput);
-      setAiDebugResult(debugData);
+      const debugData = await requestAIDebugStream(
+        code,
+        errorOutput,
+        (partial) => {
+          if (controller.signal.aborted) return;
+          setAiDebugResult(partial);
+          if (partial.lineNumber) {
+            setHighlightLine(partial.lineNumber);
+          }
+        },
+        { forceRefresh, signal: controller.signal }
+      );
 
-      if (debugData.lineNumber) {
-        setHighlightLine(debugData.lineNumber);
+      if (!controller.signal.aborted) {
+        setAiDebugResult(debugData);
+        if (debugData.lineNumber) {
+          setHighlightLine(debugData.lineNumber);
+        }
       }
     } catch (err: any) {
+      if (controller.signal.aborted) return;
       setAiDebugResult({
         summary: 'Không thể phân tích lỗi.',
         errorType: 'API Error',
@@ -368,20 +574,41 @@ export default function App() {
         suggestions: ['Kiểm tra kết nối mạng hoặc thử lại sau.'],
       });
     } finally {
-      setAiLoading(false);
+      if (!controller.signal.aborted) {
+        setAiLoading(false);
+      }
     }
   };
 
-  const handleAskAIExplain = async () => {
+  const handleAskAIExplain = async (forceRefresh = false) => {
+    explainAbortRef.current?.abort();
+    const controller = new AbortController();
+    explainAbortRef.current = controller;
+
     setAiExplaining(true);
+    setAiExplainText('');
     try {
       const code = activeFile?.content || '';
-      const text = await requestAIExplain(code);
-      setAiExplainText(text);
+      const text = await requestAIExplainStream(
+        code,
+        (accumulated) => {
+          if (!controller.signal.aborted) {
+            setAiExplainText(accumulated);
+          }
+        },
+        { forceRefresh, signal: controller.signal }
+      );
+      if (!controller.signal.aborted) {
+        setAiExplainText(text);
+      }
     } catch (err: any) {
-      setAiExplainText('Lỗi: ' + (err?.message || 'Không thể tạo giải thích.'));
+      if (!controller.signal.aborted) {
+        setAiExplainText('Lỗi: ' + (err?.message || 'Không thể tạo giải thích.'));
+      }
     } finally {
-      setAiExplaining(false);
+      if (!controller.signal.aborted) {
+        setAiExplaining(false);
+      }
     }
   };
 
@@ -403,16 +630,31 @@ export default function App() {
     }
   };
 
-  // Clear current view
+  // Clear current view (no window.confirm)
   const handleClearCurrentView = () => {
     if (viewMode === 'editor') {
-      if (confirm('Bạn có muốn xóa trắng nội dung tệp hiện tại?')) {
-        handleUpdateContent('');
-      }
+      setConfirmClearEditorOpen(true);
     } else {
       setExecutionResult(null);
       setSessionInputs([]);
       setIsWaitingInput(false);
+    }
+  };
+
+  const handleSwitchGoogleAccount = async () => {
+    showToast('Đang kết nối máy chủ để chọn tài khoản Google...');
+    try {
+      const res = await googleSignIn({
+        switchAccount: true,
+        onProgress: (msg) => showToast(msg),
+      });
+      if (res?.accessToken) {
+        showToast(`Đã chuyển sang ${res.user.email || res.user.displayName || 'tài khoản Google mới'}`);
+      } else {
+        setGoogleModalOpen(true);
+      }
+    } catch {
+      setGoogleModalOpen(true);
     }
   };
 
@@ -423,43 +665,46 @@ export default function App() {
       (!!executionResult?.stderr && executionResult.stderr.trim() !== '' && executionResult.stderr.trim() !== 'PythonError'));
 
   return (
-    <div className="flex flex-col h-screen w-screen overflow-hidden bg-[#10121a] text-slate-100">
-      {/* Top Header Toolbar matching Screenshots 1 & 2 */}
+    <div className="flex flex-col h-screen w-screen overflow-hidden bg-[#070b14] text-slate-100 pb-[env(safe-area-inset-bottom,0px)] relative">
+      {/* Top Header Toolbar */}
       <Header
-        engine={engine}
-        onChangeEngine={setEngine}
         onRun={() => handleRunCode(undefined, true)}
         isRunning={isRunning}
         viewMode={viewMode}
         onChangeViewMode={setViewMode}
         onOpenAIAssistant={handleOpenAIAssistant}
-        onOpenSamples={() => setSamplesModalOpen(true)}
-        onOpenFolderMenu={() => setDrawerOpen(true)}
+        onOpenFolderMenu={() => setFileManagerOpen(true)}
         onClearCurrentView={handleClearCurrentView}
-        onOpenSyntaxColor={() => setSyntaxModalOpen(true)}
-        onOpenApiKeySettings={() => setApiKeyModalOpen(true)}
+        onOpenGoogleWorkspace={() => setGoogleModalOpen(true)}
+        googleUser={googleUser}
+        hasGoogleToken={hasGoogleToken}
         onToggleDrawer={() => setDrawerOpen(true)}
         hasError={hasError}
+        aiStatus={aiStatus}
+        aiStatusTooltip={aiStatusTooltip}
+        onCheckAiStatus={handleCheckAiStatus}
       />
 
-      {/* Main Screen: Editor view (Screenshot 2) or Terminal view (Screenshot 1) */}
+      {toastMessage && (
+        <div className="fixed top-16 left-1/2 -translate-x-1/2 z-50 px-3.5 py-2 rounded-xl bg-[#182235] border border-sky-500/50 text-xs text-sky-100 shadow-xl animate-in fade-in duration-150">
+          {toastMessage}
+        </div>
+      )}
+
+      {/* Main Screen: Editor view or Terminal view */}
       <main className="flex-1 flex flex-col overflow-hidden relative">
         {viewMode === 'editor' ? (
           <div className="flex-1 flex flex-col h-full overflow-hidden">
             <Editor
               ref={editorRef}
-              files={files}
-              activeFileId={activeFileId}
-              onSelectFile={setActiveFileId}
-              onAddFile={handleAddFile}
-              onCloseFile={handleCloseFile}
+              activeFile={activeFile}
               onChangeContent={handleUpdateContent}
               highlightLine={highlightLine}
               fontSize={fontSize}
               theme={syntaxTheme}
             />
 
-            {/* Mobile Keyboard Shortcut Bar matching Screenshot 2 (No left arrows, no right AI, slider icon button on far right) */}
+            {/* Mobile Keyboard Shortcut Bar */}
             <MobileKeyboardBar
               shortcuts={shortcuts}
               keySize={keySize}
@@ -498,10 +743,35 @@ export default function App() {
         onClose={() => setDrawerOpen(false)}
         engine={engine}
         onChangeEngine={setEngine}
-        onNewFile={handleAddFile}
+        onOpenPip={() => setPipModalOpen(true)}
+        onOpenApk={() => setApkModalOpen(true)}
+        onOpenSyntaxColor={() => setSyntaxModalOpen(true)}
+        onOpenApiKeySettings={() => setApiKeyModalOpen(true)}
+        onOpenGoogleWorkspace={() => setGoogleModalOpen(true)}
+        onSwitchGoogleAccount={handleSwitchGoogleAccount}
+        googleUser={googleUser}
+        hasGoogleToken={hasGoogleToken}
+        onServerUrlChanged={() => handleCheckAiStatus()}
+        fontSize={fontSize}
+        onChangeFontSize={(delta) => setFontSize((s) => Math.min(26, Math.max(11, s + delta)))}
+      />
+
+      {/* File & Source Manager Modal (Opened from Folder icon next to Trash) */}
+      <FileManagerModal
+        isOpen={fileManagerOpen}
+        onClose={() => setFileManagerOpen(false)}
+        files={files}
+        activeFileId={activeFileId}
+        onSelectFile={(id) => {
+          setActiveFileId(id);
+          setViewMode('editor');
+        }}
+        onCreateFile={handleCreateFile}
+        onRenameFile={handleRenameFile}
+        onCloseFile={handleCloseFile}
         onSaveToLocal={() => {
           localStorage.setItem('pydroid_files', JSON.stringify(files));
-          alert('Đã lưu mã nguồn thành công vào bộ nhớ trình duyệt!');
+          showToast('Đã lưu mã nguồn vào bộ nhớ máy!');
         }}
         onDownloadPy={() => {
           const blob = new Blob([activeFile?.content || ''], { type: 'text/plain;charset=utf-8' });
@@ -527,24 +797,58 @@ export default function App() {
             };
             setFiles((prev) => [...prev, newFile]);
             setActiveFileId(newFile.id);
+            setViewMode('editor');
           };
           reader.readAsText(file);
           e.target.value = '';
         }}
         onResetCode={() => {
-          if (confirm('Khôi phục mã nguồn ban đầu cho file này?')) {
-            handleUpdateContent(DEFAULT_MAIN_PY);
-            setHighlightLine(undefined);
-          }
+          handleUpdateContent(DEFAULT_MAIN_PY);
+          setHighlightLine(undefined);
         }}
-        onOpenAIAssistant={() => handleOpenAIAssistant('chat')}
-        onOpenPip={() => setPipModalOpen(true)}
-        onOpenApk={() => setApkModalOpen(true)}
-        onOpenSamples={() => setSamplesModalOpen(true)}
-        onOpenApiKeySettings={() => setApiKeyModalOpen(true)}
-        fontSize={fontSize}
-        onChangeFontSize={(delta) => setFontSize((s) => Math.min(26, Math.max(11, s + delta)))}
+        onOpenEditorSearch={() => {
+          setViewMode('editor');
+          setTimeout(() => editorRef.current?.openSearch(), 50);
+        }}
+        onCopyAllCode={() => {
+          navigator.clipboard?.writeText(activeFile?.content || '').catch(() => {});
+        }}
       />
+
+      {/* Non-blocking Confirmation Dialog for Clearing Editor */}
+      {confirmClearEditorOpen && (
+        <div
+          className="fixed inset-0 z-50 bg-black/75 backdrop-blur-xs flex items-center justify-center p-4"
+          onClick={() => setConfirmClearEditorOpen(false)}
+        >
+          <div
+            className="w-full max-w-sm bg-[#1a1f2c] border border-slate-700 rounded-2xl p-4 shadow-2xl space-y-3"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 className="font-bold text-sm text-slate-100">Xóa trắng mã trong tệp?</h3>
+            <p className="text-xs text-slate-300">
+              Nội dung trong tệp <span className="font-mono text-sky-300">{activeFile?.name}</span> sẽ bị xóa trắng.
+            </p>
+            <div className="flex justify-end space-x-2 pt-2 border-t border-slate-800">
+              <button
+                onClick={() => setConfirmClearEditorOpen(false)}
+                className="px-3.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs"
+              >
+                Hủy
+              </button>
+              <button
+                onClick={() => {
+                  handleUpdateContent('');
+                  setConfirmClearEditorOpen(false);
+                }}
+                className="px-3.5 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-500 text-white font-bold text-xs"
+              >
+                Xóa trắng
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Unified AI Assistant Modal (Chat, Debugger, Explainer) */}
       <AIAssistantModal
@@ -555,11 +859,11 @@ export default function App() {
         errorOutput={executionResult?.stderr || ''}
         debugResult={aiDebugResult}
         isLoadingDebug={aiLoading}
-        onRetryDebug={handleRunAIDebug}
+        onRetryDebug={(forceRefresh) => handleRunAIDebug(forceRefresh ?? true)}
         onApplyFixedCode={handleApplyFixedCode}
         explanationText={aiExplainText}
         isLoadingExplain={aiExplaining}
-        onAskExplain={handleAskAIExplain}
+        onAskExplain={(forceRefresh) => handleAskAIExplain(forceRefresh ?? false)}
         onOpenApiKeySettings={() => setApiKeyModalOpen(true)}
         onInsertCodeToEditor={(snippet) => {
           editorRef.current?.insertTextAtCursor(snippet);
@@ -619,6 +923,34 @@ export default function App() {
       <SettingsApiKeyModal
         isOpen={apiKeyModalOpen}
         onClose={() => setApiKeyModalOpen(false)}
+        onKeySaved={() => handleCheckAiStatus()}
+        onServerUrlChanged={() => handleCheckAiStatus()}
+      />
+
+      {/* Google Account, Drive, Notes & Web↔APK Sync Modal */}
+      <GoogleWorkspaceModal
+        isOpen={googleModalOpen}
+        onClose={() => setGoogleModalOpen(false)}
+        user={googleUser}
+        hasToken={hasGoogleToken}
+        files={files}
+        activeFile={activeFile}
+        syntaxTheme={syntaxTheme}
+        shortcuts={shortcuts}
+        keySize={keySize}
+        fontSize={fontSize}
+        aiStatus={aiStatus}
+        aiStatusTooltip={aiStatusTooltip}
+        onOpenFileFromDrive={handleOpenFileFromDrive}
+        onApplySyncedWorkspace={handleApplySyncedWorkspace}
+        onInsertSnippetToEditor={(snippet) => {
+          editorRef.current?.insertTextAtCursor(snippet);
+          setViewMode('editor');
+        }}
+        onOpenApiKeySettings={() => setApiKeyModalOpen(true)}
+        onOpenApkModal={() => setApkModalOpen(true)}
+        onCheckAiStatus={handleCheckAiStatus}
+        onServerUrlChanged={handleCheckAiStatus}
       />
     </div>
   );

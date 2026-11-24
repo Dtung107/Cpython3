@@ -34,16 +34,150 @@ jobs:
           npm install --legacy-peer-deps
 
       - name: 6. Xây dựng các tài nguyên ứng dụng web (npm run build)
+        env:
+          VITE_API_BASE_URL: ${{ secrets.VITE_API_BASE_URL || vars.VITE_API_BASE_URL || '' }}
         run: |
           npm run build
 
       - name: 7. Tích hợp và đồng bộ Capacitor Android
         run: |
-          npm install --save-dev --legacy-peer-deps @capacitor/core @capacitor/cli @capacitor/android
+          npm install --save-dev --legacy-peer-deps @capacitor/cli@^8 @capacitor/android@^8
           if [ ! -d "android" ]; then
             npx cap add android
           fi
           npx cap sync android
+          if [ -f "public/app-icon.jpg" ]; then
+            python3 -c "import PIL" 2>/dev/null || (sudo apt-get update && sudo apt-get install -y python3-pil)
+            python3 - << 'PYEOF'
+          import os, glob
+          from PIL import Image, ImageDraw
+
+          res_dir = "android/app/src/main/res"
+          src = Image.open("public/app-icon.jpg").convert("RGBA")
+
+          # Legacy & round mipmaps
+          sizes = {
+              "mipmap-mdpi": (48, 108),
+              "mipmap-hdpi": (72, 162),
+              "mipmap-xhdpi": (96, 216),
+              "mipmap-xxhdpi": (144, 324),
+              "mipmap-xxxhdpi": (192, 432),
+          }
+
+          for f in glob.glob(os.path.join(res_dir, "drawable*", "*ic_launcher*")) + glob.glob(os.path.join(res_dir, "mipmap*", "*ic_launcher*")):
+              try:
+                  os.remove(f)
+              except OSError:
+                  pass
+
+          for folder, (icon_px, fg_px) in sizes.items():
+              out_dir = os.path.join(res_dir, folder)
+              os.makedirs(out_dir, exist_ok=True)
+
+              # Rounded-square legacy icon
+              legacy = src.resize((icon_px, icon_px), Image.Resampling.LANCZOS)
+              mask_sq = Image.new("L", (icon_px, icon_px), 0)
+              ImageDraw.Draw(mask_sq).rounded_rectangle([0, 0, icon_px - 1, icon_px - 1], radius=max(6, icon_px // 5), fill=255)
+              legacy_out = Image.new("RGBA", (icon_px, icon_px), (0, 0, 0, 0))
+              legacy_out.paste(legacy, (0, 0), mask_sq)
+              legacy_out.save(os.path.join(out_dir, "ic_launcher.png"), "PNG")
+
+              # Circular round icon
+              mask_rd = Image.new("L", (icon_px, icon_px), 0)
+              ImageDraw.Draw(mask_rd).ellipse([0, 0, icon_px - 1, icon_px - 1], fill=255)
+              round_out = Image.new("RGBA", (icon_px, icon_px), (0, 0, 0, 0))
+              round_out.paste(legacy, (0, 0), mask_rd)
+              round_out.save(os.path.join(out_dir, "ic_launcher_round.png"), "PNG")
+
+              # Adaptive foreground scaled so the outer border ring hugs the ~67% visible safe rim
+              inner = int(fg_px * 0.72)
+              fg_canvas = Image.new("RGBA", (fg_px, fg_px), (0, 0, 0, 0))
+              fg_scaled = src.resize((inner, inner), Image.Resampling.LANCZOS)
+              offset = (fg_px - inner) // 2
+              fg_canvas.paste(fg_scaled, (offset, offset), fg_scaled)
+              fg_canvas.save(os.path.join(out_dir, "ic_launcher_foreground.png"), "PNG")
+
+          anydpi = os.path.join(res_dir, "mipmap-anydpi-v26")
+          os.makedirs(anydpi, exist_ok=True)
+          adaptive_xml = '''<?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_launcher_background"/>
+              <foreground android:drawable="@mipmap/ic_launcher_foreground"/>
+          </adaptive-icon>
+          '''
+          for name in ("ic_launcher.xml", "ic_launcher_round.xml"):
+              with open(os.path.join(anydpi, name), "w", encoding="utf-8") as fp:
+                  fp.write(adaptive_xml)
+
+          values_dir = os.path.join(res_dir, "values")
+          os.makedirs(values_dir, exist_ok=True)
+          with open(os.path.join(values_dir, "ic_launcher_background.xml"), "w", encoding="utf-8") as fp:
+              fp.write('<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    <color name="ic_launcher_background">#060911</color>\n</resources>\n')
+          print("Generated custom Android launcher icons successfully.")
+          PYEOF
+          fi
+          node -e '
+            const fs = require("fs");
+            const manifestPath = "android/app/src/main/AndroidManifest.xml";
+            if (fs.existsSync(manifestPath)) {
+              let manifest = fs.readFileSync(manifestPath, "utf8");
+              if (!manifest.includes("android:scheme=\"org.pydroid3.web\"")) {
+                const deepLinkFilter = `            <intent-filter>\n                <action android:name="android.intent.action.VIEW" />\n                <category android:name="android.intent.category.DEFAULT" />\n                <category android:name="android.intent.category.BROWSABLE" />\n                <data android:scheme="org.pydroid3.web" android:host="auth" />\n            </intent-filter>`;
+                manifest = manifest.replace(
+                  /(<activity[^>]*android:name="\.MainActivity"[^>]*>)/,
+                  `$1\n${deepLinkFilter}`
+                );
+                fs.writeFileSync(manifestPath, manifest, "utf8");
+              }
+            }
+            const p = "android/app/src/main/res/values/styles.xml";
+            if (fs.existsSync(p)) {
+              let xml = fs.readFileSync(p, "utf8");
+              if (!xml.includes("android:statusBarColor")) {
+                xml = xml.replace(
+                  /<style name="AppTheme\.NoActionBar"[^>]*>/,
+                  "$&\n        <item name=\"android:statusBarColor\">#070b14</item>\n        <item name=\"android:navigationBarColor\">#070b14</item>"
+                );
+                fs.writeFileSync(p, xml, "utf8");
+              }
+            }
+            const mainAct = "android/app/src/main/java/org/pydroid3/web/MainActivity.java";
+            if (fs.existsSync(mainAct)) {
+              const lines = [
+                "package org.pydroid3.web;",
+                "",
+                "import android.graphics.Color;",
+                "import android.os.Bundle;",
+                "import android.view.View;",
+                "import androidx.core.graphics.Insets;",
+                "import androidx.core.view.ViewCompat;",
+                "import androidx.core.view.WindowCompat;",
+                "import androidx.core.view.WindowInsetsCompat;",
+                "import com.getcapacitor.BridgeActivity;",
+                "",
+                "public class MainActivity extends BridgeActivity {",
+                "    @Override",
+                "    protected void onCreate(Bundle savedInstanceState) {",
+                "        super.onCreate(savedInstanceState);",
+                "        WindowCompat.setDecorFitsSystemWindows(getWindow(), true);",
+                "        getWindow().setStatusBarColor(Color.parseColor(\"#070b14\"));",
+                "        getWindow().setNavigationBarColor(Color.parseColor(\"#070b14\"));",
+                "        View content = findViewById(android.R.id.content);",
+                "        if (content != null) {",
+                "            content.setBackgroundColor(Color.parseColor(\"#070b14\"));",
+                "            ViewCompat.setOnApplyWindowInsetsListener(content, (v, windowInsets) -> {",
+                "                Insets bars = windowInsets.getInsets(WindowInsetsCompat.Type.systemBars());",
+                "                v.setPadding(bars.left, bars.top, bars.right, bars.bottom);",
+                "                return WindowInsetsCompat.CONSUMED;",
+                "            });",
+                "        }",
+                "    }",
+                "}",
+                ""
+              ];
+              fs.writeFileSync(mainAct, lines.join("\n"), "utf8");
+            }
+          '
 
       - name: 8. Cấp quyền thực thi cho Gradle
         run: |

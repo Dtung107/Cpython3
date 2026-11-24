@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   SlidersHorizontal,
   Save,
@@ -23,6 +23,7 @@ import {
   KeySize,
   DEFAULT_SHORTCUTS,
   PRESET_KEYBOARDS,
+  migrateLegacyPairedShortcuts,
 } from '../types/shortcuts';
 
 interface ShortcutConfigModalProps {
@@ -49,7 +50,16 @@ export const ShortcutConfigModal: React.FC<ShortcutConfigModalProps> = ({
   const [newInsertText, setNewInsertText] = useState('');
   const [newDesc, setNewDesc] = useState('');
   const [savedSuccess, setSavedSuccess] = useState(false);
+  const [noticeText, setNoticeText] = useState<string | null>(null);
   const [draggedIndex, setDraggedIndex] = useState<number | null>(null);
+
+  useEffect(() => {
+    if (isOpen) {
+      setShortcuts(initialShortcuts);
+      setKeySize(currentKeySize);
+      setNoticeText(null);
+    }
+  }, [isOpen, initialShortcuts, currentKeySize]);
 
   if (!isOpen) return null;
 
@@ -101,12 +111,12 @@ export const ShortcutConfigModal: React.FC<ShortcutConfigModalProps> = ({
     if (saved) {
       try {
         const parsed = JSON.parse(saved);
-        if (parsed.shortcuts) setShortcuts(parsed.shortcuts);
+        if (parsed.shortcuts) setShortcuts(migrateLegacyPairedShortcuts(parsed.shortcuts));
         if (parsed.keySize) setKeySize(parsed.keySize);
-        alert('Đã tải hồ sơ phím tắt cá nhân của bạn!');
+        setNoticeText('Đã tải hồ sơ phím tắt cá nhân của bạn!');
       } catch (e) {}
     } else {
-      alert('Chưa có hồ sơ phím tắt nào được lưu trước đó.');
+      setNoticeText('Chưa có hồ sơ phím tắt nào được lưu trước đó.');
     }
   };
 
@@ -131,10 +141,9 @@ export const ShortcutConfigModal: React.FC<ShortcutConfigModalProps> = ({
   };
 
   const handleResetDefault = () => {
-    if (confirm('Khôi phục danh sách và thứ tự phím tắt ban đầu của Pydroid?')) {
-      setShortcuts(DEFAULT_SHORTCUTS);
-      setKeySize('medium');
-    }
+    setShortcuts(DEFAULT_SHORTCUTS);
+    setKeySize('large');
+    setNoticeText('Đã đặt lại phím tắt tách rời mặc định (cỡ Lớn cho điện thoại). Bấm "Hoàn tất" để áp dụng.');
   };
 
   const handleComplete = () => {
@@ -177,11 +186,11 @@ export const ShortcutConfigModal: React.FC<ShortcutConfigModalProps> = ({
   return (
     <div className="fixed inset-0 z-50 bg-black/85 backdrop-blur-sm flex items-center justify-center p-2 sm:p-4 animate-in fade-in duration-200">
       <div
-        className="w-full max-w-xl max-h-[94vh] bg-[#1a1d29] border border-amber-500/30 rounded-2xl shadow-2xl flex flex-col overflow-hidden text-slate-100"
+        className="w-full max-w-xl max-h-[94vh] bg-[#0a101e] border border-cyan-500/35 rounded-2xl shadow-2xl flex flex-col overflow-hidden text-slate-100"
         onClick={(e) => e.stopPropagation()}
       >
-        {/* Header (Screenshot 4) */}
-        <div className="px-4 py-3 bg-[#202534] border-b border-slate-700/80 flex items-center justify-between shrink-0">
+        {/* Header */}
+        <div className="px-4 py-3 bg-[#0e172c] border-b border-cyan-950/80 flex items-center justify-between shrink-0">
           <div className="flex items-center space-x-2.5">
             <div className="p-2 rounded-xl bg-amber-500 text-slate-950 font-bold shadow-md">
               <SlidersHorizontal className="w-5 h-5" />
@@ -222,17 +231,17 @@ export const ShortcutConfigModal: React.FC<ShortcutConfigModalProps> = ({
             </div>
             <div className="grid grid-cols-3 gap-2">
               {[
-                { size: 'small' as KeySize, label: 'Nhỏ (Tiết kiệm)' },
-                { size: 'medium' as KeySize, label: 'Vừa (Chuẩn Pydroid)' },
-                { size: 'large' as KeySize, label: 'Lớn (Dễ bấm)' },
+                { size: 'small' as KeySize, label: 'Nhỏ (40px)' },
+                { size: 'medium' as KeySize, label: 'Vừa (46px)' },
+                { size: 'large' as KeySize, label: 'Lớn (52px • ĐT)' },
               ].map((opt) => (
                 <button
                   key={opt.size}
                   onClick={() => setKeySize(opt.size)}
                   className={`py-2 px-2 rounded-xl text-xs font-semibold border transition-all text-center ${
                     keySize === opt.size
-                      ? 'bg-[#222838] border-amber-400 text-amber-300 shadow-md ring-1 ring-amber-400/50'
-                      : 'bg-[#181c27] border-slate-700/80 text-slate-400 hover:text-slate-200'
+                      ? 'bg-[#12213d] border-cyan-400 text-cyan-200 shadow-md ring-1 ring-cyan-400/40'
+                      : 'bg-[#0d1424] border-slate-700/80 text-slate-400 hover:text-slate-200'
                   }`}
                 >
                   {opt.label}
@@ -241,7 +250,7 @@ export const ShortcutConfigModal: React.FC<ShortcutConfigModalProps> = ({
             </div>
           </div>
 
-          {/* Section: Bộ phím mẫu & Hồ sơ (Screenshot 4) */}
+          {/* Section: Bộ phím mẫu & Hồ sơ */}
           <div className="space-y-2">
             <div className="text-xs font-bold text-amber-400 flex items-center space-x-1">
               <Sparkles className="w-3.5 h-3.5 text-amber-400" />
@@ -251,27 +260,27 @@ export const ShortcutConfigModal: React.FC<ShortcutConfigModalProps> = ({
             <div className="grid grid-cols-2 gap-2 text-xs">
               <button
                 onClick={() => handleApplyPreset('default')}
-                className="p-2 rounded-xl bg-[#1d2230] hover:bg-[#252b3d] border border-slate-700 text-slate-200 text-left font-medium transition active:scale-95"
+                className="p-2 rounded-xl bg-[#0e172a] hover:bg-[#15223d] border border-slate-700/80 text-slate-200 text-left font-medium transition active:scale-95"
               >
                 ⭐ Mặc định Pydroid
               </button>
               <button
                 onClick={() => handleApplyPreset('math')}
-                className="p-2 rounded-xl bg-[#1d2230] hover:bg-[#252b3d] border border-slate-700 text-slate-200 text-left font-medium transition active:scale-95"
+                className="p-2 rounded-xl bg-[#0e172a] hover:bg-[#15223d] border border-slate-700/80 text-slate-200 text-left font-medium transition active:scale-95"
               >
                 🔢 Toán học &amp; Lôgic
               </button>
               <button
                 onClick={() => handleApplyPreset('structure')}
-                className="p-2 rounded-xl bg-[#1d2230] hover:bg-[#252b3d] border border-slate-700 text-slate-200 text-left font-medium transition active:scale-95"
+                className="p-2 rounded-xl bg-[#0e172a] hover:bg-[#15223d] border border-slate-700/80 text-slate-200 text-left font-medium transition active:scale-95"
               >
                 ⚡ Hàm &amp; Cấu trúc
               </button>
               <button
                 onClick={() => handleApplyPreset('minimal')}
-                className="p-2 rounded-xl bg-[#1d2230] hover:bg-[#252b3d] border border-slate-700 text-slate-200 text-left font-medium transition active:scale-95"
+                className="p-2 rounded-xl bg-[#0e172a] hover:bg-[#15223d] border border-slate-700/80 text-slate-200 text-left font-medium transition active:scale-95"
               >
-                🎯 Tối giản (14 phím)
+                🎯 Tối giản (16 phím)
               </button>
             </div>
 
@@ -296,6 +305,11 @@ export const ShortcutConfigModal: React.FC<ShortcutConfigModalProps> = ({
             {savedSuccess && (
               <div className="text-center text-[11px] text-emerald-400 font-semibold bg-emerald-950/40 py-1 rounded-lg border border-emerald-800/60">
                 ✓ Đã lưu cấu hình phím tắt cá nhân của bạn thành công!
+              </div>
+            )}
+            {noticeText && (
+              <div className="text-center text-[11px] text-sky-300 font-medium bg-sky-950/40 py-1 px-2 rounded-lg border border-sky-800/60">
+                {noticeText}
               </div>
             )}
           </div>

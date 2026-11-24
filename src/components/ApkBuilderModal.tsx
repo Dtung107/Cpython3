@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   Smartphone,
   X,
@@ -22,6 +22,7 @@ import {
   generateReadme,
   detectRequirements,
 } from '../services/apkGenerator';
+import { downloadProjectUpdateZip } from '../utils/updateBundle';
 
 interface ApkBuilderModalProps {
   isOpen: boolean;
@@ -48,8 +49,41 @@ export const ApkBuilderModal: React.FC<ApkBuilderModalProps> = ({
   const [isGenerating, setIsGenerating] = useState(false);
   const [downloadSuccess, setDownloadSuccess] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [syntaxWarning, setSyntaxWarning] = useState<string | null>(null);
+  const [isDownloadingUpdate, setIsDownloadingUpdate] = useState(false);
+  const [updateStatusMsg, setUpdateStatusMsg] = useState<string | null>(null);
 
   const detectedRequirements = detectRequirements(pythonCode);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    if (!pythonCode.trim()) {
+      setSyntaxWarning('Trình soạn thảo đang trống. Hãy nhập mã Python trước khi đóng gói APK.');
+      return;
+    }
+    const pyodide = window.pyodideInstance;
+    if (pyodide) {
+      try {
+        pyodide.globals.set('__apk_syntax_check', pythonCode);
+        pyodide.runPython(`
+import ast
+try:
+    ast.parse(__apk_syntax_check)
+finally:
+    del __apk_syntax_check
+`);
+        setSyntaxWarning(null);
+      } catch (err: any) {
+        const msg = String(err?.message || err || '');
+        const match = msg.match(/SyntaxError:.*|IndentationError:.*/);
+        setSyntaxWarning(match ? match[0] : 'Phát hiện lỗi cú pháp Python trong mã nguồn hiện tại.');
+      }
+    } else if (/^\s*for\s+so\s+in\s+danh_sach\s*$/m.test(pythonCode)) {
+      setSyntaxWarning('SyntaxError: Dòng "for so in danh_sach" đang thiếu dấu hai chấm (:). Đây là mã mẫu cố tình tạo lỗi để thử AI Debugger — hãy sửa lỗi hoặc chọn mã mẫu khác trước khi đóng gói APK.');
+    } else {
+      setSyntaxWarning(null);
+    }
+  }, [isOpen, pythonCode]);
 
   if (!isOpen) return null;
 
@@ -94,6 +128,17 @@ export const ApkBuilderModal: React.FC<ApkBuilderModalProps> = ({
     navigator.clipboard.writeText(text);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
+  };
+
+  const handleDownloadUpdateBundle = async () => {
+    setIsDownloadingUpdate(true);
+    setUpdateStatusMsg(null);
+    try {
+      const res = await downloadProjectUpdateZip((msg) => setUpdateStatusMsg(msg));
+      setUpdateStatusMsg(res.message);
+    } finally {
+      setIsDownloadingUpdate(false);
+    }
   };
 
   return (
@@ -178,6 +223,37 @@ export const ApkBuilderModal: React.FC<ApkBuilderModalProps> = ({
 
         {/* Modal Body */}
         <div className="flex-1 overflow-y-auto p-4 space-y-4">
+          {/* Clarification Banner: Single Script App vs Full IDE APK */}
+          <div className="p-3 rounded-xl bg-sky-950/40 border border-sky-500/50 flex items-start space-x-2.5 text-xs">
+            <Smartphone className="w-4 h-4 text-sky-400 shrink-0 mt-0.5" />
+            <div className="space-y-1">
+              <div className="font-bold text-sky-300">
+                Phạm vi đóng gói: Chỉ đóng gói đoạn code Python hiện tại thành app riêng
+              </div>
+              <p className="text-slate-300 text-[11px] leading-relaxed">
+                File APK tạo ở đây là ứng dụng độc lập để chạy riêng đoạn code của bạn (không kèm khung soạn thảo IDE hay AI). Nếu muốn đóng gói <strong className="text-white">toàn bộ ứng dụng Pydroid 3 Web</strong> (đầy đủ trình soạn thảo, AI Gemini, giao diện &amp; icon mới giống hệt bản web), hãy tải gói file cập nhật cho mã nguồn GitHub cũ bên dưới rồi tải lên bằng Token GitHub và chạy workflow <code className="text-sky-200 font-mono">build-apk.yml</code>.
+              </p>
+              <div className="pt-1.5 flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={handleDownloadUpdateBundle}
+                  disabled={isDownloadingUpdate}
+                  className="px-3 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 border border-amber-400/50 text-amber-200 font-semibold text-[11px] flex items-center space-x-1.5 transition disabled:opacity-60"
+                >
+                  <Download className="w-3.5 h-3.5 text-amber-300" />
+                  <span>
+                    {isDownloadingUpdate
+                      ? 'Đang nén file cập nhật...'
+                      : 'Tải các file cập nhật cho mã nguồn cũ (.ZIP)'}
+                  </span>
+                </button>
+                {updateStatusMsg && (
+                  <span className="text-[11px] text-emerald-300">{updateStatusMsg}</span>
+                )}
+              </div>
+            </div>
+          </div>
+
           {/* Warning Banner: Chrome Auto-Translate Hazard */}
           <div className="p-3 rounded-xl bg-amber-950/40 border border-amber-500/60 flex items-start space-x-2.5 text-xs">
             <span className="text-base shrink-0 leading-none mt-0.5">⚠️</span>
@@ -190,6 +266,20 @@ export const ApkBuilderModal: React.FC<ApkBuilderModalProps> = ({
               </p>
             </div>
           </div>
+
+          {syntaxWarning && (
+            <div className="p-3 rounded-xl bg-red-950/50 border border-red-500/70 flex items-start space-x-2.5 text-xs">
+              <span className="text-base shrink-0 leading-none mt-0.5">🚨</span>
+              <div className="space-y-1">
+                <div className="font-bold text-red-300">
+                  Cảnh báo lỗi cú pháp Python — Buildozer sẽ thất bại khi biên dịch!
+                </div>
+                <p className="text-red-200/90 text-[11px] font-mono break-words">
+                  {syntaxWarning}
+                </p>
+              </div>
+            </div>
+          )}
 
           {activeTab === 'guide' ? (
             <>

@@ -11,23 +11,35 @@ import {
   ShieldCheck,
   Trash2,
   Sparkles,
+  Server,
 } from 'lucide-react';
 import {
   getSavedGeminiApiKey,
   saveGeminiApiKey,
   validateGeminiApiKey,
 } from '../services/geminiService';
+import {
+  getApiBaseUrl,
+  getCustomServerUrl,
+  hasReachablePublicBackendOnApk,
+  saveCustomServerUrl,
+  clearCustomServerUrl,
+  testBackendServerUrl,
+  isMobileOrApk,
+} from '../utils/apiConfig';
 
 interface SettingsApiKeyModalProps {
   isOpen: boolean;
   onClose: () => void;
   onKeySaved?: (savedKey: string) => void;
+  onServerUrlChanged?: () => void;
 }
 
 export const SettingsApiKeyModal: React.FC<SettingsApiKeyModalProps> = ({
   isOpen,
   onClose,
   onKeySaved,
+  onServerUrlChanged,
 }) => {
   const [apiKeyInput, setApiKeyInput] = useState('');
   const [savedKey, setSavedKey] = useState('');
@@ -35,6 +47,9 @@ export const SettingsApiKeyModal: React.FC<SettingsApiKeyModalProps> = ({
   const [isValidating, setIsValidating] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
+  const [showServerBox, setShowServerBox] = useState(false);
+  const [serverUrlInput, setServerUrlInput] = useState('');
+  const [isTestingServer, setIsTestingServer] = useState(false);
 
   useEffect(() => {
     if (isOpen) {
@@ -44,6 +59,9 @@ export const SettingsApiKeyModal: React.FC<SettingsApiKeyModalProps> = ({
       setErrorMessage(null);
       setSuccessMessage(null);
       setShowKey(false);
+      setServerUrlInput(getCustomServerUrl());
+      setShowServerBox(isMobileOrApk() && !hasReachablePublicBackendOnApk());
+      setIsTestingServer(false);
     }
   }, [isOpen]);
 
@@ -85,14 +103,57 @@ export const SettingsApiKeyModal: React.FC<SettingsApiKeyModalProps> = ({
         setErrorMessage(
           result.error || 'Khóa API không hợp lệ hoặc thiếu quyền hạn cần thiết.'
         );
+        if (result.isConnectionError && isMobileOrApk()) {
+          setShowServerBox(true);
+        }
       }
     } catch (err: any) {
       setErrorMessage(
         err?.message || 'Không thể kiểm tra khóa API. Vui lòng kiểm tra kết nối mạng và thử lại.'
       );
+      if (isMobileOrApk()) {
+        setShowServerBox(true);
+      }
     } finally {
       setIsValidating(false);
     }
+  };
+
+  const handleSaveServerUrl = async () => {
+    const saved = saveCustomServerUrl(serverUrlInput);
+    if (saved.ok === false) {
+      setSuccessMessage(null);
+      setErrorMessage(saved.error);
+      return;
+    }
+
+    setServerUrlInput(saved.url);
+    onServerUrlChanged?.();
+
+    setIsTestingServer(true);
+    setErrorMessage(null);
+    setSuccessMessage(null);
+
+    try {
+      const check = await testBackendServerUrl(saved.url);
+      if (check.ok) {
+        setSuccessMessage(
+          `${check.message} Bây giờ bạn hãy bấm "Kiểm tra & Lưu Khóa" để hoàn tất.`
+        );
+      } else {
+        setErrorMessage(`Đã lưu URL (${saved.url}) nhưng ${check.message}`);
+      }
+    } finally {
+      setIsTestingServer(false);
+    }
+  };
+
+  const handleClearServerUrl = () => {
+    clearCustomServerUrl();
+    setServerUrlInput('');
+    setErrorMessage(null);
+    setSuccessMessage('Đã xóa URL máy chủ tùy chỉnh.');
+    onServerUrlChanged?.();
   };
 
   const handleClearKey = () => {
@@ -106,11 +167,11 @@ export const SettingsApiKeyModal: React.FC<SettingsApiKeyModalProps> = ({
 
   return (
     <div
-      className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-3 sm:p-4 animate-in fade-in duration-200"
+      className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-3 sm:p-4 pt-[calc(0.75rem+env(safe-area-inset-top,0px))] pb-[calc(0.75rem+env(safe-area-inset-bottom,0px))] animate-in fade-in duration-200"
       onClick={onClose}
     >
       <div
-        className="w-full max-w-lg bg-[#141722] border border-sky-800/60 rounded-2xl shadow-2xl overflow-hidden text-slate-100 flex flex-col"
+        className="w-full max-w-lg max-h-full overflow-y-auto bg-[#141722] border border-sky-800/60 rounded-2xl shadow-2xl text-slate-100 flex flex-col"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
@@ -211,9 +272,80 @@ export const SettingsApiKeyModal: React.FC<SettingsApiKeyModalProps> = ({
           {errorMessage && (
             <div className="p-3 rounded-xl bg-rose-950/60 border border-rose-500/70 text-rose-200 text-xs flex items-start space-x-2 animate-in fade-in duration-150">
               <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
-              <div className="space-y-0.5 flex-1 leading-snug">
-                <div className="font-bold text-rose-300">Không thể lưu khóa API:</div>
+              <div className="space-y-1 flex-1 leading-snug">
+                <div className="font-bold text-rose-300">Không thể hoàn tất:</div>
                 <div className="text-[11px] text-rose-100">{errorMessage}</div>
+                {isMobileOrApk() && !showServerBox && (
+                  <button
+                    type="button"
+                    onClick={() => setShowServerBox(true)}
+                    className="mt-1 text-[11px] text-sky-300 underline font-medium"
+                  >
+                    Cấu hình URL Máy chủ Backend cho APK
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Optional direct toggle on APK before trying */}
+          {isMobileOrApk() && !showServerBox && !errorMessage && (
+            <div className="flex justify-end">
+              <button
+                type="button"
+                onClick={() => setShowServerBox(true)}
+                className="text-[11px] text-sky-400 hover:text-sky-300 underline flex items-center space-x-1"
+              >
+                <Server className="w-3 h-3" />
+                <span>Cấu hình URL Máy chủ Backend ({getCustomServerUrl() ? 'Đã đặt riêng' : 'Chưa đặt riêng'})</span>
+              </button>
+            </div>
+          )}
+
+          {/* Inline APK Backend Server Configuration when needed */}
+          {isMobileOrApk() && showServerBox && (
+            <div className="p-3 rounded-xl bg-[#111521] border border-sky-700/60 space-y-2 text-[11px] animate-in fade-in duration-150">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center space-x-1.5 font-semibold text-sky-300">
+                  <Server className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+                  <span>URL Máy Chủ Backend (Cloud Run / Render / LAN)</span>
+                </div>
+                {getCustomServerUrl() && (
+                  <button
+                    type="button"
+                    onClick={handleClearServerUrl}
+                    className="text-[10px] text-rose-400 hover:text-rose-300 underline"
+                  >
+                    Xóa URL riêng
+                  </button>
+                )}
+              </div>
+              <p className="text-[10.5px] text-slate-400 leading-snug">
+                Đang trỏ tới: <span className="text-slate-300 font-mono break-all">{getApiBaseUrl()}</span>.
+                {!getCustomServerUrl() && (
+                  <> URL xem trước AI Studio chưa công khai cho APK rời. Hãy bấm <strong>Deploy</strong> trong AI Studio (hoặc triển khai <code className="text-sky-300">server.ts</code> lên Cloud Run / Render / Railway, hoặc chạy Wi-Fi LAN <code className="text-sky-300">http://IP:3000</code>) rồi dán URL thật vào đây:</>
+                )}
+              </p>
+              <div className="flex items-center space-x-1.5">
+                <input
+                  type="text"
+                  value={serverUrlInput}
+                  onChange={(e) => {
+                    setServerUrlInput(e.target.value);
+                    setErrorMessage(null);
+                  }}
+                  placeholder="https://my-pydroid-server.run.app"
+                  className="flex-1 bg-[#0a0d14] border border-slate-700 focus:border-sky-400 rounded-lg px-2.5 py-1.5 text-[11px] text-slate-100 font-mono focus:outline-none"
+                />
+                <button
+                  type="button"
+                  onClick={handleSaveServerUrl}
+                  disabled={isTestingServer}
+                  className="px-2.5 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 disabled:opacity-50 text-white font-semibold text-[11px] shrink-0 flex items-center space-x-1"
+                >
+                  {isTestingServer && <RefreshCw className="w-3 h-3 animate-spin" />}
+                  <span>{isTestingServer ? 'Đang thử...' : 'Lưu URL'}</span>
+                </button>
               </div>
             </div>
           )}
@@ -223,7 +355,7 @@ export const SettingsApiKeyModal: React.FC<SettingsApiKeyModalProps> = ({
             <div className="p-3 rounded-xl bg-emerald-950/60 border border-emerald-500/70 text-emerald-200 text-xs flex items-start space-x-2 animate-in fade-in duration-150">
               <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
               <div className="space-y-0.5 flex-1 leading-snug">
-                <div className="font-bold text-emerald-300">Xác thực thành công!</div>
+                <div className="font-bold text-emerald-300">Thông báo:</div>
                 <div className="text-[11px] text-emerald-100">{successMessage}</div>
               </div>
             </div>

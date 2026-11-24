@@ -20,7 +20,7 @@ import {
   Key,
 } from 'lucide-react';
 import { AIDebugResult } from '../types';
-import { requestAIChat, ChatMessage } from '../services/geminiService';
+import { requestAIChat, requestAIChatStream, ChatMessage } from '../services/geminiService';
 
 interface AIAssistantModalProps {
   isOpen: boolean;
@@ -30,11 +30,11 @@ interface AIAssistantModalProps {
   errorOutput?: string;
   debugResult: AIDebugResult | null;
   isLoadingDebug: boolean;
-  onRetryDebug: () => void;
+  onRetryDebug: (forceRefresh?: boolean) => void;
   onApplyFixedCode: (fixedCode: string) => void;
   explanationText: string;
   isLoadingExplain: boolean;
-  onAskExplain: () => void;
+  onAskExplain: (forceRefresh?: boolean) => void;
   onInsertCodeToEditor: (snippet: string) => void;
   onOpenApiKeySettings?: () => void;
 }
@@ -117,28 +117,51 @@ export const AIAssistantModal: React.FC<AIAssistantModalProps> = ({
     setChatInput('');
     setIsLoadingChat(true);
 
-    try {
-      const reply = await requestAIChat(
-        newMessages.map((m) => ({ role: m.role, content: m.content })),
-        currentCode
-      );
+    const assistantId = (Date.now() + 1).toString();
+    let accumulatedText = '';
 
-      const assistantMsg: ChatMessage = {
-        id: (Date.now() + 1).toString(),
-        role: 'assistant',
-        content: reply,
-        timestamp: Date.now(),
-      };
-      setMessages((prev) => [...prev, assistantMsg]);
+    try {
+      const recentMessages = newMessages
+        .slice(-12)
+        .map((m) => ({ role: m.role, content: m.content }));
+      const trimmedCode = currentCode.length > 6000 ? currentCode.slice(0, 6000) : currentCode;
+
+      await requestAIChatStream(
+        recentMessages,
+        (chunk) => {
+          accumulatedText += chunk;
+          setMessages((prev) => {
+            const last = prev[prev.length - 1];
+            if (last && last.id === assistantId) {
+              return [...prev.slice(0, -1), { ...last, content: accumulatedText }];
+            } else {
+              return [
+                ...prev,
+                {
+                  id: assistantId,
+                  role: 'assistant',
+                  content: accumulatedText,
+                  timestamp: Date.now(),
+                },
+              ];
+            }
+          });
+        },
+        trimmedCode
+      );
     } catch (err: any) {
       let friendlyError = 'Không thể kết nối đến Trợ lý AI lúc này. Vui lòng thử lại sau giây lát.';
       const raw = err?.message || '';
       if (raw.includes('503') || raw.includes('high demand') || raw.includes('UNAVAILABLE')) {
-        friendlyError = 'Hệ thống AI đang xử lý lượng yêu cầu cao. Chúng tôi đã tự động kết nối lại, bạn vui lòng nhấn gửi lại nhé!';
+        friendlyError = 'Hệ thống AI đang xử lý lượng yêu cầu cao. Bạn vui lòng nhấn gửi lại sau vài giây nhé!';
       } else if (raw.includes('429') || raw.includes('RESOURCE_EXHAUSTED')) {
         friendlyError = 'Hệ thống AI đang tạm thời đạt giới hạn lưu lượng miễn phí. Vui lòng thử lại sau 1-2 phút nhé!';
-      } else if (raw.includes('Failed to fetch') || raw.includes('NetworkError')) {
-        friendlyError = 'Không thể kết nối đến Máy chủ AI Cloud. Vui lòng kiểm tra kết nối mạng của thiết bị hoặc nhấn Menu > Cấu hình Máy Chủ.';
+      } else if (raw.includes('HTML response') || raw.includes('404')) {
+        friendlyError = 'Bản APK chưa kết nối được tới máy chủ Cloud Backend. Hãy mở Menu > Máy Chủ AI & Backend Cloud > Cấu hình để nhập URL máy chủ đã triển khai.';
+      } else if (raw.includes('Failed to fetch') || raw.includes('NetworkError') || raw.includes('Backend')) {
+        friendlyError = raw;
+      } else if (raw.includes('API Key') || raw.includes('Khóa')) {
+        friendlyError = raw;
       }
 
       const errorMsg: ChatMessage = {
@@ -181,9 +204,9 @@ export const AIAssistantModal: React.FC<AIAssistantModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/85 backdrop-blur-sm flex items-center justify-center p-2 sm:p-4 animate-in fade-in duration-200">
+    <div className="fixed inset-0 z-50 bg-black/85 backdrop-blur-sm flex items-center justify-center p-2 sm:p-4 pt-[calc(0.5rem+env(safe-area-inset-top,0px))] pb-[calc(0.5rem+env(safe-area-inset-bottom,0px))] animate-in fade-in duration-200">
       <div
-        className="w-full max-w-2xl h-[92vh] max-h-[760px] bg-[#161a25] border border-slate-700/80 rounded-2xl shadow-2xl flex flex-col overflow-hidden text-slate-100"
+        className="w-full max-w-2xl h-full max-h-[760px] bg-[#161a25] border border-slate-700/80 rounded-2xl shadow-2xl flex flex-col overflow-hidden text-slate-100"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header with Title and Model Badge */}
@@ -229,15 +252,15 @@ export const AIAssistantModal: React.FC<AIAssistantModalProps> = ({
                     },
                   ]);
                 } else if (activeTab === 'debug') {
-                  onRetryDebug();
+                  onRetryDebug(true);
                 } else {
-                  onAskExplain();
+                  onAskExplain(true);
                 }
               }}
               title="Làm mới"
               className="p-1.5 rounded-lg hover:bg-slate-700 text-slate-400 hover:text-white transition"
             >
-              <RotateCw className="w-4 h-4" />
+              <RotateCw className={`w-4 h-4 ${(activeTab === 'debug' && isLoadingDebug) || (activeTab === 'explain' && isLoadingExplain) ? 'animate-spin text-sky-400' : ''}`} />
             </button>
             <button
               onClick={onClose}
@@ -263,7 +286,12 @@ export const AIAssistantModal: React.FC<AIAssistantModalProps> = ({
           </button>
 
           <button
-            onClick={() => setActiveTab('debug')}
+            onClick={() => {
+              setActiveTab('debug');
+              if (!debugResult && !isLoadingDebug) {
+                onRetryDebug(false);
+              }
+            }}
             className={`pb-2 px-3 font-semibold border-b-2 flex items-center space-x-1.5 transition ${
               activeTab === 'debug'
                 ? 'border-rose-500 text-rose-400'
@@ -277,8 +305,8 @@ export const AIAssistantModal: React.FC<AIAssistantModalProps> = ({
           <button
             onClick={() => {
               setActiveTab('explain');
-              if (!explanationText && !isLoadingExplain) {
-                onAskExplain();
+              if (!isLoadingExplain) {
+                onAskExplain(false);
               }
             }}
             className={`pb-2 px-3 font-semibold border-b-2 flex items-center space-x-1.5 transition ${
@@ -377,7 +405,7 @@ export const AIAssistantModal: React.FC<AIAssistantModalProps> = ({
                 );
               })}
 
-              {isLoadingChat && (
+              {isLoadingChat && messages[messages.length - 1]?.role !== 'assistant' && (
                 <div className="flex items-center space-x-2 text-slate-400 text-xs py-2 pl-9">
                   <div className="w-4 h-4 rounded-full border-2 border-sky-400/30 border-t-sky-400 animate-spin" />
                   <span>Trợ lý AI đang suy nghĩ câu trả lời...</span>
@@ -421,18 +449,25 @@ export const AIAssistantModal: React.FC<AIAssistantModalProps> = ({
         {/* TAB 2: GỠ LỖI & TỰ SỬA MÃ (AI DEBUGGER) */}
         {activeTab === 'debug' && (
           <div className="flex-1 overflow-y-auto p-4 space-y-3.5">
-            {isLoadingDebug ? (
+            {isLoadingDebug && !debugResult ? (
               <div className="py-16 flex flex-col items-center justify-center space-y-3 text-slate-400">
                 <div className="w-12 h-12 rounded-full border-2 border-rose-500/20 border-t-rose-400 animate-spin" />
                 <p className="text-sm font-medium text-slate-300">
                   AI đang quét Traceback và phân tích cú pháp...
                 </p>
                 <p className="text-xs text-slate-500">
-                  Đang sửa toàn bộ mã nguồn sẵn sàng chạy lại
+                  Đang khởi tạo luồng phân tích thời gian thực
                 </p>
               </div>
             ) : debugResult ? (
               <>
+                {isLoadingDebug && (
+                  <div className="px-3 py-1.5 rounded-lg bg-sky-950/40 border border-sky-700/40 flex items-center space-x-2 text-[11px] text-sky-300">
+                    <div className="w-3 h-3 rounded-full border-2 border-sky-400/30 border-t-sky-400 animate-spin shrink-0" />
+                    <span>AI đang tiếp tục hoàn thiện phân tích và mã sửa...</span>
+                  </div>
+                )}
+
                 {/* Error Summary Banner */}
                 <div className="p-3.5 rounded-xl bg-rose-950/30 border border-rose-800/50 flex items-start space-x-3">
                   <div className="p-2 rounded-lg bg-rose-900/50 text-rose-400 shrink-0">
@@ -441,7 +476,7 @@ export const AIAssistantModal: React.FC<AIAssistantModalProps> = ({
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center space-x-2 flex-wrap gap-1">
                       <span className="px-2 py-0.5 rounded text-xs font-bold bg-rose-900/60 text-rose-200 border border-rose-700/60 font-mono">
-                        {debugResult.errorType || 'Lỗi Thực Thi'}
+                        {debugResult.errorType || 'Đang xác định lỗi...'}
                       </span>
                       {debugResult.lineNumber ? (
                         <span className="px-2 py-0.5 rounded text-xs bg-amber-950/60 text-amber-300 border border-amber-800/50 font-mono">
@@ -450,21 +485,23 @@ export const AIAssistantModal: React.FC<AIAssistantModalProps> = ({
                       ) : null}
                     </div>
                     <p className="text-sm font-semibold text-slate-100 mt-1.5">
-                      {debugResult.summary}
+                      {debugResult.summary || 'Đang tóm tắt vấn đề...'}
                     </p>
                   </div>
                 </div>
 
                 {/* Explanation */}
-                <div className="p-3.5 rounded-xl bg-[#191d2a] border border-slate-800">
-                  <h3 className="text-xs font-bold text-sky-400 uppercase tracking-wider mb-2 flex items-center space-x-1.5">
-                    <Lightbulb className="w-3.5 h-3.5" />
-                    <span>Nguyên Nhân &amp; Cách Khắc Phục</span>
-                  </h3>
-                  <p className="text-xs sm:text-sm text-slate-300 leading-relaxed whitespace-pre-line">
-                    {debugResult.explanation}
-                  </p>
-                </div>
+                {(debugResult.explanation || isLoadingDebug) && (
+                  <div className="p-3.5 rounded-xl bg-[#191d2a] border border-slate-800">
+                    <h3 className="text-xs font-bold text-sky-400 uppercase tracking-wider mb-2 flex items-center space-x-1.5">
+                      <Lightbulb className="w-3.5 h-3.5" />
+                      <span>Nguyên Nhân &amp; Cách Khắc Phục</span>
+                    </h3>
+                    <p className="text-xs sm:text-sm text-slate-300 leading-relaxed whitespace-pre-line">
+                      {debugResult.explanation || 'Đang phân tích nguyên nhân chi tiết...'}
+                    </p>
+                  </div>
+                )}
 
                 {/* Fixed Code Box */}
                 {debugResult.fixedCode && (
@@ -493,25 +530,27 @@ export const AIAssistantModal: React.FC<AIAssistantModalProps> = ({
                 )}
 
                 {/* Switch to Chat to discuss further */}
-                <div className="flex items-center justify-between p-2.5 bg-[#171b28] rounded-xl border border-slate-800 text-xs">
-                  <span className="text-slate-400">Bạn muốn hỏi thêm chi tiết về lỗi này?</span>
-                  <button
-                    onClick={() => {
-                      setActiveTab('chat');
-                      handleSendChatMessage(`Tôi đang gặp lỗi ${debugResult.errorType}: "${debugResult.summary}". Bạn có thể giải thích chi tiết hơn cho tôi không?`);
-                    }}
-                    className="px-3 py-1 bg-sky-600/30 hover:bg-sky-600 text-sky-200 hover:text-white rounded-lg font-medium flex items-center space-x-1 transition"
-                  >
-                    <span>Hỏi AI trong Chat</span>
-                    <ArrowRight className="w-3 h-3" />
-                  </button>
-                </div>
+                {!isLoadingDebug && (
+                  <div className="flex items-center justify-between p-2.5 bg-[#171b28] rounded-xl border border-slate-800 text-xs">
+                    <span className="text-slate-400">Bạn muốn hỏi thêm chi tiết về lỗi này?</span>
+                    <button
+                      onClick={() => {
+                        setActiveTab('chat');
+                        handleSendChatMessage(`Tôi đang gặp lỗi ${debugResult.errorType}: "${debugResult.summary}". Bạn có thể giải thích chi tiết hơn cho tôi không?`);
+                      }}
+                      className="px-3 py-1 bg-sky-600/30 hover:bg-sky-600 text-sky-200 hover:text-white rounded-lg font-medium flex items-center space-x-1 transition"
+                    >
+                      <span>Hỏi AI trong Chat</span>
+                      <ArrowRight className="w-3 h-3" />
+                    </button>
+                  </div>
+                )}
               </>
             ) : (
               <div className="py-12 text-center text-slate-400 text-xs space-y-3">
                 <p>Không phát hiện lỗi runtime nào gần đây.</p>
                 <button
-                  onClick={onRetryDebug}
+                  onClick={() => onRetryDebug(false)}
                   className="px-4 py-2 bg-rose-600 hover:bg-rose-500 text-white rounded-xl text-xs font-bold inline-flex items-center space-x-1.5 shadow"
                 >
                   <Bug className="w-4 h-4" />
@@ -525,7 +564,7 @@ export const AIAssistantModal: React.FC<AIAssistantModalProps> = ({
         {/* TAB 3: GIẢI THÍCH MÃ NGUỒN (EXPLAIN) */}
         {activeTab === 'explain' && (
           <div className="flex-1 overflow-y-auto p-4 space-y-3">
-            {isLoadingExplain ? (
+            {isLoadingExplain && !explanationText ? (
               <div className="py-14 flex flex-col items-center justify-center space-y-2 text-slate-400">
                 <div className="w-8 h-8 rounded-full border-2 border-indigo-500/20 border-t-indigo-400 animate-spin" />
                 <p className="text-xs">AI đang giải thích cấu trúc mã...</p>
@@ -537,7 +576,7 @@ export const AIAssistantModal: React.FC<AIAssistantModalProps> = ({
             ) : (
               <div className="py-10 text-center">
                 <button
-                  onClick={onAskExplain}
+                  onClick={() => onAskExplain(false)}
                   className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold inline-flex items-center space-x-2 shadow"
                 >
                   <BookOpen className="w-4 h-4" />
@@ -560,8 +599,8 @@ export const AIAssistantModal: React.FC<AIAssistantModalProps> = ({
 
             <button
               onClick={handleApplyFixed}
-              disabled={appliedDebug}
-              className="px-4 py-1.5 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-bold text-xs flex items-center space-x-1.5 shadow-lg active:scale-95 transition"
+              disabled={appliedDebug || isLoadingDebug}
+              className="px-4 py-1.5 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 disabled:opacity-50 text-white font-bold text-xs flex items-center space-x-1.5 shadow-lg active:scale-95 transition"
             >
               {appliedDebug ? (
                 <>
@@ -571,7 +610,7 @@ export const AIAssistantModal: React.FC<AIAssistantModalProps> = ({
               ) : (
                 <>
                   <FileCheck className="w-4 h-4" />
-                  <span>Áp Dụng Mã Đã Sửa Vào Editor</span>
+                  <span>{isLoadingDebug ? 'Đang tạo mã sửa...' : 'Áp Dụng Mã Đã Sửa Vào Editor'}</span>
                 </>
               )}
             </button>
