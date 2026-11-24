@@ -17,6 +17,7 @@ import {
   Download,
   UserCheck,
   Sparkles,
+  FolderOpen,
 } from 'lucide-react';
 import {
   ShortcutKey,
@@ -25,6 +26,12 @@ import {
   PRESET_KEYBOARDS,
   migrateLegacyPairedShortcuts,
 } from '../types/shortcuts';
+import {
+  saveShortcutsConfigToDefaultFolder,
+  loadShortcutsConfigFromDefaultFolder,
+  parseShortcutsConfigJson,
+  getDefaultFolderPath,
+} from '../services/deviceStorageService';
 
 interface ShortcutConfigModalProps {
   isOpen: boolean;
@@ -50,6 +57,7 @@ export const ShortcutConfigModal: React.FC<ShortcutConfigModalProps> = ({
   const [newInsertText, setNewInsertText] = useState('');
   const [newDesc, setNewDesc] = useState('');
   const [savedSuccess, setSavedSuccess] = useState(false);
+  const [isProfileBusy, setIsProfileBusy] = useState(false);
   const [noticeText, setNoticeText] = useState<string | null>(null);
   const [draggedIndex, setDraggedIndex] = useState<number | null>(null);
 
@@ -100,24 +108,122 @@ export const ShortcutConfigModal: React.FC<ShortcutConfigModalProps> = ({
     setShortcuts([...front, ...rest]);
   };
 
-  const handleSaveProfile = () => {
-    localStorage.setItem('pydroid_user_shortcuts', JSON.stringify({ shortcuts, keySize }));
-    setSavedSuccess(true);
-    setTimeout(() => setSavedSuccess(false), 2500);
+  const applyLoadedProfile = (
+    loadedShortcuts: ShortcutKey[],
+    loadedKeySize: KeySize | undefined,
+    sourceNotice: string
+  ) => {
+    const resolvedSize = loadedKeySize || keySize;
+    setShortcuts(loadedShortcuts);
+    setKeySize(resolvedSize);
+    try {
+      localStorage.setItem(
+        'pydroid_user_shortcuts',
+        JSON.stringify({ shortcuts: loadedShortcuts, keySize: resolvedSize })
+      );
+      localStorage.setItem('pydroid_shortcuts', JSON.stringify(loadedShortcuts));
+      localStorage.setItem('pydroid_keysize', resolvedSize);
+    } catch {}
+    onSaveShortcuts(loadedShortcuts, resolvedSize);
+    setNoticeText(sourceNotice);
   };
 
-  const handleLoadProfile = () => {
-    const saved = localStorage.getItem('pydroid_user_shortcuts');
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        if (parsed.shortcuts) setShortcuts(migrateLegacyPairedShortcuts(parsed.shortcuts));
-        if (parsed.keySize) setKeySize(parsed.keySize);
-        setNoticeText('Đã tải hồ sơ phím tắt cá nhân của bạn!');
-      } catch (e) {}
-    } else {
-      setNoticeText('Chưa có hồ sơ phím tắt nào được lưu trước đó.');
+  const handleSaveProfile = async () => {
+    if (isProfileBusy) return;
+    setIsProfileBusy(true);
+    try {
+      localStorage.setItem('pydroid_user_shortcuts', JSON.stringify({ shortcuts, keySize }));
+      onSaveShortcuts(shortcuts, keySize);
+      const res = await saveShortcutsConfigToDefaultFolder(shortcuts, keySize);
+      setSavedSuccess(true);
+      if (res.ok && res.displayPath) {
+        setNoticeText(`Đã lưu & áp dụng cấu hình phím tắt vào: ${res.displayPath}`);
+      } else {
+        setNoticeText(`Đã lưu hồ sơ phím tắt (Thư mục mặc định: Documents/${getDefaultFolderPath()}).`);
+      }
+      setTimeout(() => setSavedSuccess(false), 2500);
+    } finally {
+      setIsProfileBusy(false);
     }
+  };
+
+  const handleLoadProfile = async () => {
+    if (isProfileBusy) return;
+    setIsProfileBusy(true);
+    setSavedSuccess(false);
+    try {
+      // 1. Check dedicated user profile in localStorage OR default folder config
+      const folderConfig = await loadShortcutsConfigFromDefaultFolder();
+      if (folderConfig?.shortcuts && folderConfig.shortcuts.length > 0) {
+        applyLoadedProfile(
+          folderConfig.shortcuts,
+          folderConfig.keySize,
+          `✓ Đã tải & áp dụng ${folderConfig.shortcuts.length} phím từ thư mục mặc định (${folderConfig.displayPath})!`
+        );
+        return;
+      }
+
+      const savedProfileRaw = localStorage.getItem('pydroid_user_shortcuts');
+      if (savedProfileRaw) {
+        const parsed = parseShortcutsConfigJson(savedProfileRaw);
+        if (parsed?.shortcuts && parsed.shortcuts.length > 0) {
+          applyLoadedProfile(
+            parsed.shortcuts,
+            parsed.keySize,
+            `✓ Đã tải & áp dụng hồ sơ phím tắt cá nhân (${parsed.shortcuts.length} phím)!`
+          );
+          return;
+        }
+      }
+
+      // 2. Fallback: active saved shortcuts from localStorage if user saved via "Hoàn tất"
+      const activeRaw = localStorage.getItem('pydroid_shortcuts');
+      const activeSize = localStorage.getItem('pydroid_keysize') as KeySize | null;
+      if (activeRaw) {
+        const parsedActive = parseShortcutsConfigJson(activeRaw);
+        if (parsedActive?.shortcuts && parsedActive.shortcuts.length > 0) {
+          applyLoadedProfile(
+            parsedActive.shortcuts,
+            activeSize || parsedActive.keySize,
+            `✓ Đã khôi phục cấu hình phím tắt đang lưu trong bộ nhớ máy (${parsedActive.shortcuts.length} phím)!`
+          );
+          return;
+        }
+      }
+
+      setNoticeText(
+        `Chưa tìm thấy hồ sơ trong bộ nhớ hoặc Documents/${getDefaultFolderPath()}/pydroid_shortcuts_config.json. Bạn có thể bấm "Lưu vào Hồ sơ của tôi" hoặc dùng "Chọn file .json từ điện thoại" bên dưới.`
+      );
+    } catch (err: any) {
+      setNoticeText(`Không thể tải hồ sơ phím tắt (${err?.message || 'Lỗi đọc dữ liệu'}).`);
+    } finally {
+      setIsProfileBusy(false);
+    }
+  };
+
+  const handleImportProfileFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = async (ev) => {
+      const content = String(ev.target?.result || '');
+      const parsed = parseShortcutsConfigJson(content);
+      if (!parsed?.shortcuts || parsed.shortcuts.length === 0) {
+        setNoticeText(`Tệp "${file.name}" không phải là file cấu hình phím tắt hợp lệ.`);
+        return;
+      }
+      applyLoadedProfile(
+        parsed.shortcuts,
+        parsed.keySize,
+        `✓ Đã nhập & áp dụng hồ sơ từ "${file.name}" (${parsed.shortcuts.length} phím)!`
+      );
+      await saveShortcutsConfigToDefaultFolder(
+        parsed.shortcuts,
+        parsed.keySize || keySize
+      ).catch(() => {});
+    };
+    reader.readAsText(file);
+    e.target.value = '';
   };
 
   const handleAddCustomKey = (e: React.FormEvent) => {
@@ -148,6 +254,7 @@ export const ShortcutConfigModal: React.FC<ShortcutConfigModalProps> = ({
 
   const handleComplete = () => {
     onSaveShortcuts(shortcuts, keySize);
+    saveShortcutsConfigToDefaultFolder(shortcuts, keySize).catch(() => {});
     onClose();
   };
 
@@ -287,28 +394,43 @@ export const ShortcutConfigModal: React.FC<ShortcutConfigModalProps> = ({
             {/* Profile buttons */}
             <div className="flex items-center space-x-2 pt-1 text-xs">
               <button
+                type="button"
                 onClick={handleSaveProfile}
-                className="flex-1 py-1.5 px-3 rounded-xl bg-[#222736] hover:bg-slate-700 border border-slate-700 text-amber-300 font-medium flex items-center justify-center space-x-1.5 transition active:scale-95"
+                disabled={isProfileBusy}
+                className="flex-1 py-2 px-3 rounded-xl bg-[#222736] hover:bg-slate-700 border border-slate-700 text-amber-300 font-medium flex items-center justify-center space-x-1.5 transition active:scale-95 disabled:opacity-60"
               >
-                <UserCheck className="w-3.5 h-3.5" />
+                <UserCheck className="w-3.5 h-3.5 shrink-0" />
                 <span>Lưu vào Hồ sơ của tôi</span>
               </button>
               <button
+                type="button"
                 onClick={handleLoadProfile}
-                className="flex-1 py-1.5 px-3 rounded-xl bg-[#222736] hover:bg-slate-700 border border-slate-700 text-emerald-300 font-medium flex items-center justify-center space-x-1.5 transition active:scale-95"
+                disabled={isProfileBusy}
+                className="flex-1 py-2 px-3 rounded-xl bg-[#222736] hover:bg-slate-700 border border-slate-700 text-emerald-300 font-medium flex items-center justify-center space-x-1.5 transition active:scale-95 disabled:opacity-60"
               >
-                <Download className="w-3.5 h-3.5" />
-                <span>Tải Hồ sơ của tôi</span>
+                <Download className="w-3.5 h-3.5 shrink-0" />
+                <span>{isProfileBusy ? 'Đang tải...' : 'Tải Hồ sơ của tôi'}</span>
               </button>
             </div>
 
+            <label className="w-full py-1.5 px-3 rounded-xl bg-[#111829] hover:bg-[#172138] border border-cyan-500/30 text-cyan-300 text-[11px] font-medium flex items-center justify-center space-x-1.5 transition cursor-pointer">
+              <FolderOpen className="w-3.5 h-3.5 shrink-0" />
+              <span>Chọn file hồ sơ (.json) từ bộ nhớ điện thoại</span>
+              <input
+                type="file"
+                accept=".json,application/json,text/plain"
+                onChange={handleImportProfileFile}
+                className="hidden"
+              />
+            </label>
+
             {savedSuccess && (
-              <div className="text-center text-[11px] text-emerald-400 font-semibold bg-emerald-950/40 py-1 rounded-lg border border-emerald-800/60">
+              <div className="text-center text-[11px] text-emerald-400 font-semibold bg-emerald-950/40 py-1.5 px-2 rounded-lg border border-emerald-800/60">
                 ✓ Đã lưu cấu hình phím tắt cá nhân của bạn thành công!
               </div>
             )}
             {noticeText && (
-              <div className="text-center text-[11px] text-sky-300 font-medium bg-sky-950/40 py-1 px-2 rounded-lg border border-sky-800/60">
+              <div className="text-center text-[11px] text-sky-200 font-medium bg-sky-950/50 py-1.5 px-2.5 rounded-lg border border-sky-700/60 leading-snug">
                 {noticeText}
               </div>
             )}

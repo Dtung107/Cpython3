@@ -36,12 +36,16 @@ import {
   SavedServerEntry,
 } from '../utils/apiConfig';
 import { downloadProjectUpdateZip } from '../utils/updateBundle';
+import { PyodideWarmState } from '../services/pyodideService';
+import { CPythonWarmState, resetCPythonWarmState } from '../services/cpythonService';
 
 interface DrawerMenuProps {
   isOpen: boolean;
   onClose: () => void;
   engine: EngineType;
   onChangeEngine: (engine: EngineType) => void;
+  pyodideWarmState?: PyodideWarmState;
+  cpythonWarmState?: CPythonWarmState;
   onOpenPip: () => void;
   onOpenApk: () => void;
   onOpenSyntaxColor: () => void;
@@ -60,6 +64,8 @@ export const DrawerMenu: React.FC<DrawerMenuProps> = ({
   onClose,
   engine,
   onChangeEngine,
+  pyodideWarmState = 'idle',
+  cpythonWarmState = 'idle',
   onOpenPip,
   onOpenApk,
   onOpenSyntaxColor,
@@ -146,6 +152,7 @@ export const DrawerMenu: React.FC<DrawerMenuProps> = ({
     setServerInputUrl(saved.url);
     setServerInputLabel('');
     setServerHistory(getSavedServerHistory());
+    resetCPythonWarmState();
     onServerUrlChanged?.();
     await handleTestConnection(saved.url);
   };
@@ -156,6 +163,7 @@ export const DrawerMenu: React.FC<DrawerMenuProps> = ({
       setActiveCustomUrl(saved.url);
       setServerInputUrl(saved.url);
       setServerHistory(getSavedServerHistory());
+      resetCPythonWarmState();
       onServerUrlChanged?.();
       await handleTestConnection(saved.url);
     }
@@ -168,6 +176,7 @@ export const DrawerMenu: React.FC<DrawerMenuProps> = ({
     setActiveCustomUrl(remainingActive);
     if (!remainingActive) {
       setServerInputUrl('');
+      resetCPythonWarmState();
       onServerUrlChanged?.();
     }
   };
@@ -176,6 +185,7 @@ export const DrawerMenu: React.FC<DrawerMenuProps> = ({
     clearCustomServerUrl();
     setActiveCustomUrl('');
     setServerInputUrl('');
+    resetCPythonWarmState();
     setServerStatus({
       tested: false,
       online: false,
@@ -511,6 +521,36 @@ export const DrawerMenu: React.FC<DrawerMenuProps> = ({
                       <div className="text-[10px] text-slate-400 mt-0.5 leading-snug">
                         Chạy trực tiếp trên APK
                       </div>
+                      <div className="mt-1 flex items-center space-x-1 text-[9.5px]">
+                        <span
+                          className={`w-1.5 h-1.5 rounded-full ${
+                            pyodideWarmState === 'ready'
+                              ? 'bg-emerald-400'
+                              : pyodideWarmState === 'warming'
+                              ? 'bg-amber-400 animate-pulse'
+                              : pyodideWarmState === 'error'
+                              ? 'bg-rose-400'
+                              : 'bg-slate-500'
+                          }`}
+                        />
+                        <span
+                          className={
+                            pyodideWarmState === 'ready'
+                              ? 'text-emerald-300'
+                              : pyodideWarmState === 'warming'
+                              ? 'text-amber-300'
+                              : 'text-slate-400'
+                          }
+                        >
+                          {pyodideWarmState === 'ready'
+                            ? 'Đã nạp sẵn sàng'
+                            : pyodideWarmState === 'warming'
+                            ? 'Đang khởi động...'
+                            : pyodideWarmState === 'error'
+                            ? 'Cần mạng lần đầu'
+                            : 'Chưa nạp'}
+                        </span>
+                      </div>
                     </div>
                   </button>
 
@@ -539,6 +579,38 @@ export const DrawerMenu: React.FC<DrawerMenuProps> = ({
                       <div className="font-bold text-[12px] leading-tight">CPython 3.10</div>
                       <div className="text-[10px] text-slate-400 mt-0.5 leading-snug">
                         Linux Native Backend
+                      </div>
+                      <div className="mt-1 flex items-center space-x-1 text-[9.5px]">
+                        <span
+                          className={`w-1.5 h-1.5 rounded-full ${
+                            cpythonWarmState === 'ready'
+                              ? 'bg-emerald-400'
+                              : cpythonWarmState === 'warming'
+                              ? 'bg-amber-400 animate-pulse'
+                              : cpythonWarmState === 'offline'
+                              ? 'bg-rose-400'
+                              : 'bg-slate-500'
+                          }`}
+                        />
+                        <span
+                          className={
+                            cpythonWarmState === 'ready'
+                              ? 'text-emerald-300'
+                              : cpythonWarmState === 'warming'
+                              ? 'text-amber-300'
+                              : cpythonWarmState === 'offline'
+                              ? 'text-rose-300'
+                              : 'text-slate-400'
+                          }
+                        >
+                          {cpythonWarmState === 'ready'
+                            ? 'Máy chủ sẵn sàng'
+                            : cpythonWarmState === 'warming'
+                            ? 'Đang kết nối...'
+                            : cpythonWarmState === 'offline'
+                            ? 'Ngoại tuyến'
+                            : 'Chờ kết nối'}
+                        </span>
                       </div>
                     </div>
                   </button>

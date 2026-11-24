@@ -1,4 +1,4 @@
-import React, { useRef, useState, useImperativeHandle, forwardRef, useMemo } from 'react';
+import React, { useRef, useState, useImperativeHandle, forwardRef, useMemo, useLayoutEffect } from 'react';
 import { X } from 'lucide-react';
 import { CodeFile } from '../types';
 import { SyntaxTheme } from '../types/theme';
@@ -209,6 +209,13 @@ export const Editor = forwardRef<EditorHandle, EditorProps>(
     const textareaRef = useRef<HTMLTextAreaElement>(null);
     const lineNumbersRef = useRef<HTMLDivElement>(null);
     const backdropRef = useRef<HTMLDivElement>(null);
+    const pendingSelectionRef = useRef<{
+      start: number;
+      end: number;
+      scrollTop: number;
+      scrollLeft: number;
+      shouldFocusIfBlurred: boolean;
+    } | null>(null);
 
     const [cursorPos, setCursorPos] = useState({ line: 1, col: 1 });
     const [showSearch, setShowSearch] = useState(false);
@@ -239,6 +246,43 @@ export const Editor = forwardRef<EditorHandle, EditorProps>(
       });
     };
 
+    // Apply selection & scroll synchronously right after React commits textarea.value,
+    // without calling focus() when textarea is already focused (prevents Android IME restart).
+    useLayoutEffect(() => {
+      const pending = pendingSelectionRef.current;
+      const textarea = textareaRef.current;
+      if (!pending || !textarea) return;
+      pendingSelectionRef.current = null;
+
+      if (pending.shouldFocusIfBlurred && document.activeElement !== textarea) {
+        textarea.focus({ preventScroll: true });
+      }
+      textarea.setSelectionRange(pending.start, pending.end);
+      textarea.scrollTop = pending.scrollTop;
+      textarea.scrollLeft = pending.scrollLeft;
+      handleScroll();
+      updateCursorPosition();
+    }, [activeFile?.content]);
+
+    const applyProgrammaticEdit = (
+      updatedText: string,
+      selStart: number,
+      selEnd: number,
+      shouldFocusIfBlurred: boolean = true
+    ) => {
+      const textarea = textareaRef.current;
+      if (!textarea) return;
+      const wasFocused = document.activeElement === textarea;
+      pendingSelectionRef.current = {
+        start: selStart,
+        end: selEnd,
+        scrollTop: textarea.scrollTop,
+        scrollLeft: textarea.scrollLeft,
+        shouldFocusIfBlurred: shouldFocusIfBlurred && !wasFocused,
+      };
+      onChangeContent(updatedText);
+    };
+
     const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
       const textarea = textareaRef.current;
       if (!textarea) return;
@@ -256,12 +300,7 @@ export const Editor = forwardRef<EditorHandle, EditorProps>(
         const val = textarea.value;
 
         const updated = val.substring(0, start) + '    ' + val.substring(end);
-        onChangeContent(updated);
-
-        setTimeout(() => {
-          textarea.selectionStart = textarea.selectionEnd = start + 4;
-          updateCursorPosition();
-        }, 0);
+        applyProgrammaticEdit(updated, start + 4, start + 4, false);
       } else if (e.key === 'Enter') {
         const start = textarea.selectionStart;
         const val = textarea.value;
@@ -277,13 +316,8 @@ export const Editor = forwardRef<EditorHandle, EditorProps>(
           e.preventDefault();
           const updated =
             val.substring(0, start) + '\n' + indent + val.substring(start);
-          onChangeContent(updated);
-
-          setTimeout(() => {
-            textarea.selectionStart = textarea.selectionEnd =
-              start + 1 + indent.length;
-            updateCursorPosition();
-          }, 0);
+          const pos = start + 1 + indent.length;
+          applyProgrammaticEdit(updated, pos, pos, false);
         }
       }
     };
@@ -307,25 +341,13 @@ export const Editor = forwardRef<EditorHandle, EditorProps>(
             selected +
             closeChar +
             val.substring(end);
-          onChangeContent(updated);
-          setTimeout(() => {
-            textarea.selectionStart = start + 1;
-            textarea.selectionEnd = end + 1;
-            textarea.focus();
-            updateCursorPosition();
-          }, 0);
+          applyProgrammaticEdit(updated, start + 1, end + 1, true);
           return;
         }
 
         const updated = val.substring(0, start) + text + val.substring(end);
-        onChangeContent(updated);
-
-        setTimeout(() => {
-          const newPos = start + text.length - cursorOffset;
-          textarea.selectionStart = textarea.selectionEnd = newPos;
-          textarea.focus();
-          updateCursorPosition();
-        }, 0);
+        const newPos = start + text.length - cursorOffset;
+        applyProgrammaticEdit(updated, newPos, newPos, true);
       },
 
       indentSelection: () => {
@@ -334,12 +356,7 @@ export const Editor = forwardRef<EditorHandle, EditorProps>(
         const start = textarea.selectionStart;
         const val = textarea.value;
         const updated = val.substring(0, start) + '    ' + val.substring(start);
-        onChangeContent(updated);
-        setTimeout(() => {
-          textarea.selectionStart = textarea.selectionEnd = start + 4;
-          textarea.focus();
-          updateCursorPosition();
-        }, 0);
+        applyProgrammaticEdit(updated, start + 4, start + 4, true);
       },
 
       unindentSelection: () => {
@@ -352,15 +369,8 @@ export const Editor = forwardRef<EditorHandle, EditorProps>(
         if (lineChunk === '    ') {
           const updated =
             val.substring(0, lineStart) + val.substring(lineStart + 4);
-          onChangeContent(updated);
-          setTimeout(() => {
-            textarea.selectionStart = textarea.selectionEnd = Math.max(
-              lineStart,
-              start - 4
-            );
-            textarea.focus();
-            updateCursorPosition();
-          }, 0);
+          const newPos = Math.max(lineStart, start - 4);
+          applyProgrammaticEdit(updated, newPos, newPos, true);
         }
       },
 

@@ -79,7 +79,7 @@ export const MobileKeyboardBar: React.FC<MobileKeyboardBarProps> = ({
         {/* Horizontally scrollable individual keys — zero gaps, clean vertical dividers */}
         <div
           ref={scrollRef}
-          className="flex-1 flex items-stretch overflow-x-auto no-scrollbar scroll-smooth divide-x divide-cyan-950/90"
+          className="flex-1 flex items-stretch overflow-x-auto no-scrollbar scroll-smooth touch-pan-x divide-x divide-cyan-950/90"
         >
           {visibleKeys.map((k) => {
             const isTabOrHighlight = k.isHighlight || k.id === 'tab';
@@ -108,6 +108,11 @@ export const MobileKeyboardBar: React.FC<MobileKeyboardBarProps> = ({
               <button
                 key={k.id}
                 type="button"
+                tabIndex={-1}
+                onMouseDown={(e) => {
+                  // Prevent textarea blur so Android's primary soft keyboard stays open without restarting
+                  e.preventDefault();
+                }}
                 onClick={() => handleKeyClick(k)}
                 title={k.description || k.label}
                 className={`shrink-0 h-full font-mono font-semibold flex items-center justify-center transition-colors whitespace-nowrap tracking-tight ${sizeConfig.keyWidth} ${sizeConfig.text} ${keyColorClass}`}

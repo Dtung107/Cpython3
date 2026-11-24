@@ -6,10 +6,9 @@ import {
   Check,
   Download,
   RotateCw,
-  Sparkles,
-  ExternalLink,
-  Layers,
+  Trash2,
   AlertCircle,
+  HardDrive,
 } from 'lucide-react';
 import { PipPackage } from '../types';
 
@@ -17,7 +16,9 @@ interface PipManagerModalProps {
   isOpen: boolean;
   onClose: () => void;
   installedPackages: string[];
+  userSavedPackages?: string[];
   onInstallPackage: (packageName: string) => Promise<void>;
+  onRemovePackage?: (packageName: string) => Promise<void>;
   isInstalling: boolean;
   installMessage?: string;
 }
@@ -87,11 +88,15 @@ const POPULAR_PACKAGES: Omit<PipPackage, 'installed'>[] = [
   },
 ];
 
+const POPULAR_NAMES_SET = new Set(POPULAR_PACKAGES.map((p) => p.name.toLowerCase()));
+
 export const PipManagerModal: React.FC<PipManagerModalProps> = ({
   isOpen,
   onClose,
   installedPackages,
+  userSavedPackages = [],
   onInstallPackage,
+  onRemovePackage,
   isInstalling,
   installMessage,
 }) => {
@@ -100,6 +105,9 @@ export const PipManagerModal: React.FC<PipManagerModalProps> = ({
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   if (!isOpen) return null;
+
+  const installedSet = new Set(installedPackages.map((p) => p.toLowerCase()));
+  const savedSet = new Set(userSavedPackages.map((p) => p.toLowerCase()));
 
   const handleInstall = async (pkgName: string) => {
     setErrorMsg(null);
@@ -110,6 +118,16 @@ export const PipManagerModal: React.FC<PipManagerModalProps> = ({
     }
   };
 
+  const handleRemove = async (pkgName: string) => {
+    if (!onRemovePackage) return;
+    setErrorMsg(null);
+    try {
+      await onRemovePackage(pkgName);
+    } catch (err: any) {
+      setErrorMsg(err?.message || `Không thể gỡ ${pkgName}`);
+    }
+  };
+
   const handleCustomInstall = (e: React.FormEvent) => {
     e.preventDefault();
     if (!customPkg.trim()) return;
@@ -117,14 +135,24 @@ export const PipManagerModal: React.FC<PipManagerModalProps> = ({
     setCustomPkg('');
   };
 
+  const query = search.trim().toLowerCase();
+
+  // Custom user-installed packages not in POPULAR_PACKAGES
+  const customSavedPackages = userSavedPackages
+    .map((p) => p.toLowerCase())
+    .filter((name) => !POPULAR_NAMES_SET.has(name) && (!query || name.includes(query)));
+
   const filteredPackages = POPULAR_PACKAGES.filter(
     (p) =>
-      p.name.toLowerCase().includes(search.toLowerCase()) ||
-      p.description.toLowerCase().includes(search.toLowerCase())
+      p.name.toLowerCase().includes(query) ||
+      p.description.toLowerCase().includes(query)
   );
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-2 sm:p-4 animate-in fade-in duration-200">
+    <div
+      className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-2 sm:p-4 animate-in fade-in duration-200"
+      onClick={onClose}
+    >
       <div
         className="w-full max-w-2xl max-h-[90vh] bg-[#161a24] border border-slate-700/80 rounded-2xl shadow-2xl flex flex-col overflow-hidden text-slate-100"
         onClick={(e) => e.stopPropagation()}
@@ -143,7 +171,7 @@ export const PipManagerModal: React.FC<PipManagerModalProps> = ({
                 </span>
               </h2>
               <p className="text-[11px] text-slate-400">
-                Cài đặt các gói thư viện Python bổ trợ cho WASM & CPython
+                Cài đặt &amp; tự động lưu thư viện trên thiết bị (WASM &amp; CPython)
               </p>
             </div>
           </div>
@@ -188,7 +216,7 @@ export const PipManagerModal: React.FC<PipManagerModalProps> = ({
             <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-2.5" />
             <input
               type="text"
-              placeholder="Tìm kiếm trong danh sách gói phổ biến..."
+              placeholder="Tìm kiếm thư viện đã lưu hoặc gói phổ biến..."
               value={search}
               onChange={(e) => setSearch(e.target.value)}
               className="w-full bg-[#181c26] border border-slate-700/60 rounded-lg pl-8 pr-3 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-purple-400 placeholder-slate-500"
@@ -202,7 +230,7 @@ export const PipManagerModal: React.FC<PipManagerModalProps> = ({
             <RotateCw className="w-5 h-5 animate-spin text-purple-400 shrink-0" />
             <div className="text-xs">
               <div className="font-semibold text-purple-200">
-                Đang tiến hành tải & cài đặt...
+                Đang tiến hành tải &amp; lưu thư viện...
               </div>
               <div className="text-[11px] text-purple-300/80">
                 {installMessage || 'Vui lòng chờ trong giây lát...'}
@@ -221,8 +249,56 @@ export const PipManagerModal: React.FC<PipManagerModalProps> = ({
 
         {/* Package list */}
         <div className="flex-1 overflow-y-auto p-3 space-y-2">
+          {/* Custom User-Installed Packages */}
+          {customSavedPackages.length > 0 && (
+            <div className="space-y-2 pb-2 mb-2 border-b border-slate-800">
+              <div className="text-[11px] font-bold uppercase tracking-wider text-emerald-400/90 px-1 flex items-center space-x-1.5">
+                <HardDrive className="w-3.5 h-3.5" />
+                <span>Thư viện tùy chỉnh đã cài &amp; lưu ({customSavedPackages.length})</span>
+              </div>
+              {customSavedPackages.map((pkgName) => (
+                <div
+                  key={`custom-${pkgName}`}
+                  className="p-3 rounded-xl bg-[#16202a] border border-emerald-500/35 transition flex items-center justify-between space-x-3"
+                >
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center space-x-2">
+                      <span className="font-mono font-bold text-sm text-slate-100">
+                        {pkgName}
+                      </span>
+                      <span className="px-1.5 py-0.5 rounded text-[9px] bg-emerald-500/20 text-emerald-300 font-semibold border border-emerald-500/30">
+                        Đã lưu trên máy
+                      </span>
+                    </div>
+                    <p className="text-xs text-slate-400 mt-1">
+                      Tự động khôi phục khi mở lại ứng dụng hoặc khi import trong Python.
+                    </p>
+                  </div>
+                  <div className="shrink-0 flex items-center space-x-1.5">
+                    <div className="px-2.5 py-1 rounded-lg bg-emerald-950/40 border border-emerald-600/40 text-emerald-400 text-xs font-semibold flex items-center space-x-1">
+                      <Check className="w-3.5 h-3.5" />
+                      <span>Đã có</span>
+                    </div>
+                    {onRemovePackage && (
+                      <button
+                        onClick={() => handleRemove(pkgName)}
+                        disabled={isInstalling}
+                        title={`Gỡ ${pkgName} khỏi danh sách đã lưu`}
+                        className="p-1.5 rounded-lg bg-slate-800/80 hover:bg-rose-950/70 border border-slate-700 hover:border-rose-500/50 text-slate-400 hover:text-rose-300 transition disabled:opacity-40"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
           {filteredPackages.map((pkg) => {
-            const isInstalled = installedPackages.includes(pkg.name.toLowerCase());
+            const pkgLower = pkg.name.toLowerCase();
+            const isInstalled = installedSet.has(pkgLower);
+            const isUserSaved = savedSet.has(pkgLower);
 
             return (
               <div
@@ -230,13 +306,18 @@ export const PipManagerModal: React.FC<PipManagerModalProps> = ({
                 className="p-3 rounded-xl bg-[#1a1f2b] border border-slate-700/60 hover:border-slate-600 transition flex items-center justify-between space-x-3"
               >
                 <div className="flex-1 min-w-0">
-                  <div className="flex items-center space-x-2">
+                  <div className="flex items-center space-x-2 flex-wrap gap-y-1">
                     <span className="font-mono font-bold text-sm text-slate-100">
                       {pkg.name}
                     </span>
                     {pkg.isPopular && (
                       <span className="px-1.5 py-0.2 rounded text-[9px] bg-amber-500/20 text-amber-300 font-semibold border border-amber-500/30">
                         Khuyên dùng
+                      </span>
+                    )}
+                    {isUserSaved && (
+                      <span className="px-1.5 py-0.2 rounded text-[9px] bg-emerald-500/15 text-emerald-300 font-semibold border border-emerald-500/30">
+                        Đã lưu
                       </span>
                     )}
                     <span className="text-[10px] text-slate-400 uppercase tracking-wider">
@@ -248,12 +329,24 @@ export const PipManagerModal: React.FC<PipManagerModalProps> = ({
                   </p>
                 </div>
 
-                <div className="shrink-0">
+                <div className="shrink-0 flex items-center space-x-1.5">
                   {isInstalled ? (
-                    <div className="px-2.5 py-1 rounded-lg bg-emerald-950/40 border border-emerald-600/40 text-emerald-400 text-xs font-semibold flex items-center space-x-1">
-                      <Check className="w-3.5 h-3.5" />
-                      <span>Đã có</span>
-                    </div>
+                    <>
+                      <div className="px-2.5 py-1 rounded-lg bg-emerald-950/40 border border-emerald-600/40 text-emerald-400 text-xs font-semibold flex items-center space-x-1">
+                        <Check className="w-3.5 h-3.5" />
+                        <span>Đã có</span>
+                      </div>
+                      {isUserSaved && onRemovePackage && (
+                        <button
+                          onClick={() => handleRemove(pkg.name)}
+                          disabled={isInstalling}
+                          title={`Gỡ ${pkg.name} khỏi danh sách đã lưu`}
+                          className="p-1.5 rounded-lg bg-slate-800/80 hover:bg-rose-950/70 border border-slate-700 hover:border-rose-500/50 text-slate-400 hover:text-rose-300 transition disabled:opacity-40"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+                    </>
                   ) : (
                     <button
                       onClick={() => handleInstall(pkg.name)}
@@ -272,7 +365,9 @@ export const PipManagerModal: React.FC<PipManagerModalProps> = ({
 
         {/* Footer info */}
         <div className="px-4 py-2.5 bg-[#1d2230] border-t border-slate-700/80 flex items-center justify-between text-xs text-slate-400">
-          <span>{installedPackages.length} thư viện đã sẵn sàng</span>
+          <span>
+            {installedPackages.length} sẵn sàng • {userSavedPackages.length} gói đã lưu trên máy
+          </span>
           <button
             onClick={onClose}
             className="px-3 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs transition"
