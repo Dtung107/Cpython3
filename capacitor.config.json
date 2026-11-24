@@ -1,5 +1,5 @@
 {
-  "appId": "com.pydroid3.webide",
+  "appId": "org.pydroid3.web",
   "appName": "Pydroid 3 Web",
   "webDir": "dist",
   "server": {
@@ -7,8 +7,13 @@
     "cleartext": true
   },
   "android": {
-    "allowMixedContent": true,
-    "captureInput": false,
-    "webContentsDebuggingEnabled": true
+    "allowMixedContent": true
+  },
+  "plugins": {
+    "StatusBar": {
+      "overlaysWebView": false,
+      "backgroundColor": "#11131a",
+      "style": "DARK"
+    }
   }
 }
