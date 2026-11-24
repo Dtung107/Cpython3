@@ -1,6 +1,0 @@
-{
-  "name": "Pydroid 3 Web - Python IDE & AI Debugger for Android",
-  "description": "Môi trường lập trình Python Pydroid 3 tối ưu cho màn hình cảm ứng Android. Hỗ trợ động cơ kép CPython & Pyodide WASM offline, terminal tương tác input(), bàn phím ký tự nhanh, trợ lý gỡ lỗi Gemini AI và đóng gói APK Android qua GitHub Actions.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}

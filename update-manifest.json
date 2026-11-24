@@ -1,0 +1,43 @@
+{
+  "generatedBy": "Pydroid 3 JSZip Export Utility",
+  "generatedAt": "2026-11-22T03:01:13.352Z",
+  "fileCount": 6,
+  "files": [
+    {
+      "path": "main.py",
+      "category": "py",
+      "isChanged": true,
+      "sizeBytes": 984
+    },
+    {
+      "path": "capacitor.config.json",
+      "category": "config",
+      "isChanged": true,
+      "sizeBytes": 275
+    },
+    {
+      "path": "firebase-applet-config.json",
+      "category": "config",
+      "isChanged": true,
+      "sizeBytes": 460
+    },
+    {
+      "path": ".github/workflows/build-apk.yml",
+      "category": "config",
+      "isChanged": true,
+      "sizeBytes": 2226
+    },
+    {
+      "path": "pydroid-config.json",
+      "category": "config",
+      "isChanged": true,
+      "sizeBytes": 7705
+    },
+    {
+      "path": "requirements.txt",
+      "category": "config",
+      "isChanged": true,
+      "sizeBytes": 149
+    }
+  ]
+}
