@@ -1,0 +1,477 @@
+name: Xây dựng file APK Android cho Pydroid 3 Web
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 1. Kiểm tra kho lưu trữ (Checkout)
+        uses: actions/checkout@v4
+
+      - name: 2. Cài đặt Java JDK 21 (Bắt buộc cho Capacitor 7 & Gradle 8.14)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '21'
+
+      - name: 3. Cài đặt Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 4. Chấp nhận giấy phép Android SDK
+        run: |
+          yes | sdkmanager --licenses || true
+
+      - name: 5. Cài đặt các gói phụ thuộc
+        run: |
+          npm install --legacy-peer-deps
+
+      - name: 6. Xây dựng các tài nguyên ứng dụng web (npm run build)
+        env:
+          VITE_API_BASE_URL: ${{ secrets.VITE_API_BASE_URL || vars.VITE_API_BASE_URL || '' }}
+        run: |
+          npm run build
+
+      - name: 7. Tích hợp và đồng bộ Capacitor Android
+        run: |
+          npm install --save-dev --legacy-peer-deps @capacitor/cli@^8 @capacitor/android@^8
+          if [ ! -d "android" ]; then
+            npx cap add android
+          fi
+          rm -rf android/app/src/main/assets/public
+          npx cap sync android
+          if [ -f "public/app-icon.jpg" ]; then
+            python3 -c "import PIL" 2>/dev/null || (sudo apt-get update && sudo apt-get install -y python3-pil)
+            python3 - << 'PYEOF'
+          import os, glob
+          from PIL import Image, ImageDraw
+
+          res_dir = "android/app/src/main/res"
+          src = Image.open("public/app-icon.jpg").convert("RGBA")
+
+          # Legacy & round mipmaps
+          sizes = {
+              "mipmap-mdpi": (48, 108),
+              "mipmap-hdpi": (72, 162),
+              "mipmap-xhdpi": (96, 216),
+              "mipmap-xxhdpi": (144, 324),
+              "mipmap-xxxhdpi": (192, 432),
+          }
+
+          for f in glob.glob(os.path.join(res_dir, "drawable*", "*ic_launcher*")) + glob.glob(os.path.join(res_dir, "mipmap*", "*ic_launcher*")):
+              try:
+                  os.remove(f)
+              except OSError:
+                  pass
+
+          for folder, (icon_px, fg_px) in sizes.items():
+              out_dir = os.path.join(res_dir, folder)
+              os.makedirs(out_dir, exist_ok=True)
+
+              # Rounded-square legacy icon
+              legacy = src.resize((icon_px, icon_px), Image.Resampling.LANCZOS)
+              mask_sq = Image.new("L", (icon_px, icon_px), 0)
+              ImageDraw.Draw(mask_sq).rounded_rectangle([0, 0, icon_px - 1, icon_px - 1], radius=max(6, icon_px // 5), fill=255)
+              legacy_out = Image.new("RGBA", (icon_px, icon_px), (0, 0, 0, 0))
+              legacy_out.paste(legacy, (0, 0), mask_sq)
+              legacy_out.save(os.path.join(out_dir, "ic_launcher.png"), "PNG")
+
+              # Circular round icon
+              mask_rd = Image.new("L", (icon_px, icon_px), 0)
+              ImageDraw.Draw(mask_rd).ellipse([0, 0, icon_px - 1, icon_px - 1], fill=255)
+              round_out = Image.new("RGBA", (icon_px, icon_px), (0, 0, 0, 0))
+              round_out.paste(legacy, (0, 0), mask_rd)
+              round_out.save(os.path.join(out_dir, "ic_launcher_round.png"), "PNG")
+
+              # Adaptive foreground scaled so the outer border ring hugs the ~67% visible safe rim
+              inner = int(fg_px * 0.72)
+              fg_canvas = Image.new("RGBA", (fg_px, fg_px), (0, 0, 0, 0))
+              fg_scaled = src.resize((inner, inner), Image.Resampling.LANCZOS)
+              offset = (fg_px - inner) // 2
+              fg_canvas.paste(fg_scaled, (offset, offset), fg_scaled)
+              fg_canvas.save(os.path.join(out_dir, "ic_launcher_foreground.png"), "PNG")
+
+          anydpi = os.path.join(res_dir, "mipmap-anydpi-v26")
+          os.makedirs(anydpi, exist_ok=True)
+          adaptive_xml = '''<?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_launcher_background"/>
+              <foreground android:drawable="@mipmap/ic_launcher_foreground"/>
+          </adaptive-icon>
+          '''
+          for name in ("ic_launcher.xml", "ic_launcher_round.xml"):
+              with open(os.path.join(anydpi, name), "w", encoding="utf-8") as fp:
+                  fp.write(adaptive_xml)
+
+          values_dir = os.path.join(res_dir, "values")
+          os.makedirs(values_dir, exist_ok=True)
+          with open(os.path.join(values_dir, "ic_launcher_background.xml"), "w", encoding="utf-8") as fp:
+              fp.write('<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    <color name="ic_launcher_background">#060911</color>\n</resources>\n')
+          print("Generated custom Android launcher icons successfully.")
+          PYEOF
+          fi
+          node -e '
+            const fs = require("fs");
+            const manifestPath = "android/app/src/main/AndroidManifest.xml";
+            if (fs.existsSync(manifestPath)) {
+              let manifest = fs.readFileSync(manifestPath, "utf8");
+              if (!manifest.includes("android:scheme=\"org.pydroid3.web\"")) {
+                const deepLinkFilter = `            <intent-filter>\n                <action android:name="android.intent.action.VIEW" />\n                <category android:name="android.intent.category.DEFAULT" />\n                <category android:name="android.intent.category.BROWSABLE" />\n                <data android:scheme="org.pydroid3.web" android:host="auth" />\n            </intent-filter>`;
+                manifest = manifest.replace(
+                  /(<activity[^>]*android:name="\.MainActivity"[^>]*>)/,
+                  `$1\n${deepLinkFilter}`
+                );
+              }
+              if (!manifest.includes("WRITE_EXTERNAL_STORAGE")) {
+                const storagePerms = `    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />\n    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="32" />`;
+                manifest = manifest.replace(
+                  /<application/,
+                  `${storagePerms}\n\n    <application`
+                );
+              }
+              if (!manifest.includes("android.permission.VIBRATE")) {
+                manifest = manifest.replace(
+                  /<application/,
+                  `    <uses-permission android:name="android.permission.VIBRATE" />\n    <application`
+                );
+              }
+              if (!manifest.includes("android:largeHeap")) {
+                manifest = manifest.replace(
+                  /<application\b/,
+                  "<application android:largeHeap=\"true\""
+                );
+              }
+              if (!manifest.includes("android:hardwareAccelerated")) {
+                manifest = manifest.replace(
+                  /<application\b/,
+                  "<application android:hardwareAccelerated=\"true\""
+                );
+              }
+              fs.writeFileSync(manifestPath, manifest, "utf8");
+            }
+            const p = "android/app/src/main/res/values/styles.xml";
+            if (fs.existsSync(p)) {
+              let xml = fs.readFileSync(p, "utf8");
+              if (!xml.includes("android:statusBarColor")) {
+                xml = xml.replace(
+                  /<style name="AppTheme\.NoActionBar"[^>]*>/,
+                  "$&\n        <item name=\"android:statusBarColor\">#070b14</item>\n        <item name=\"android:navigationBarColor\">#070b14</item>"
+                );
+                fs.writeFileSync(p, xml, "utf8");
+              }
+            }
+            const nativePluginPath = "android/app/src/main/java/org/pydroid3/web/NativeStoragePlugin.java";
+            const pluginLines = [
+              "package org.pydroid3.web;",
+              "",
+              "import android.app.Activity;",
+              "import android.content.Intent;",
+              "import android.database.Cursor;",
+              "import android.net.Uri;",
+              "import android.os.ParcelFileDescriptor;",
+              "import android.provider.DocumentsContract;",
+              "import android.provider.OpenableColumns;",
+              "import androidx.activity.result.ActivityResult;",
+              "import com.getcapacitor.JSObject;",
+              "import com.getcapacitor.Plugin;",
+              "import com.getcapacitor.PluginCall;",
+              "import com.getcapacitor.PluginMethod;",
+              "import com.getcapacitor.annotation.ActivityCallback;",
+              "import com.getcapacitor.annotation.CapacitorPlugin;",
+              "import java.io.ByteArrayOutputStream;",
+              "import java.io.FileOutputStream;",
+              "import java.io.InputStream;",
+              "import java.io.OutputStream;",
+              "import java.nio.charset.StandardCharsets;",
+              "",
+              "@CapacitorPlugin(name = \"NativeStorage\")",
+              "public class NativeStoragePlugin extends Plugin {",
+              "",
+              "    private String queryDisplayName(Uri uri) {",
+              "        String name = \"script.py\";",
+              "        try (Cursor cursor = getContext().getContentResolver().query(uri, null, null, null, null)) {",
+              "            if (cursor != null && cursor.moveToFirst()) {",
+              "                int idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);",
+              "                if (idx >= 0) {",
+              "                    String val = cursor.getString(idx);",
+              "                    if (val != null && !val.trim().isEmpty()) {",
+              "                        name = val.trim();",
+              "                    }",
+              "                }",
+              "            }",
+              "        } catch (Exception ignored) {}",
+              "        return name;",
+              "    }",
+              "",
+              "    private boolean isUriWritable(Uri uri) {",
+              "        try (Cursor cursor = getContext().getContentResolver().query(uri, new String[]{DocumentsContract.Document.COLUMN_FLAGS}, null, null, null)) {",
+              "            if (cursor != null && cursor.moveToFirst()) {",
+              "                int idx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_FLAGS);",
+              "                if (idx >= 0) {",
+              "                    int flags = cursor.getInt(idx);",
+              "                    return (flags & DocumentsContract.Document.FLAG_SUPPORTS_WRITE) != 0;",
+              "                }",
+              "            }",
+              "        } catch (Exception ignored) {}",
+              "        return true;",
+              "    }",
+              "",
+              "    private void writeTextToUri(Uri uri, String content) throws Exception {",
+              "        byte[] bytes = content.getBytes(StandardCharsets.UTF_8);",
+              "        try (ParcelFileDescriptor pfd = getContext().getContentResolver().openFileDescriptor(uri, \"wt\")) {",
+              "            if (pfd != null) {",
+              "                try (FileOutputStream fos = new FileOutputStream(pfd.getFileDescriptor())) {",
+              "                    fos.getChannel().truncate(0);",
+              "                    fos.write(bytes);",
+              "                    fos.flush();",
+              "                    return;",
+              "                }",
+              "            }",
+              "        } catch (Exception ignored) {}",
+              "        try (OutputStream os = getContext().getContentResolver().openOutputStream(uri, \"w\")) {",
+              "            if (os == null) {",
+              "                throw new IllegalStateException(\"Cannot open output stream for URI\");",
+              "            }",
+              "            os.write(bytes);",
+              "            os.flush();",
+              "        }",
+              "    }",
+              "",
+              "    @PluginMethod",
+              "    public void openDocument(PluginCall call) {",
+              "        try {",
+              "            Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);",
+              "            intent.addCategory(Intent.CATEGORY_OPENABLE);",
+              "            intent.setType(\"*/*\");",
+              "            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);",
+              "            startActivityForResult(call, intent, \"handleOpenDocumentResult\");",
+              "        } catch (Exception e) {",
+              "            call.reject(\"Không thể mở trình chọn tệp trên thiết bị: \" + e.getMessage(), e);",
+              "        }",
+              "    }",
+              "",
+              "    @ActivityCallback",
+              "    private void handleOpenDocumentResult(PluginCall call, ActivityResult result) {",
+              "        if (call == null) return;",
+              "        if (result.getResultCode() != Activity.RESULT_OK || result.getData() == null || result.getData().getData() == null) {",
+              "            JSObject cancelled = new JSObject();",
+              "            cancelled.put(\"cancelled\", true);",
+              "            call.resolve(cancelled);",
+              "            return;",
+              "        }",
+              "        Uri uri = result.getData().getData();",
+              "        try {",
+              "            int flags = result.getData().getFlags() & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);",
+              "            if (flags == 0) {",
+              "                flags = Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION;",
+              "            }",
+              "            try {",
+              "                getContext().getContentResolver().takePersistableUriPermission(uri, flags);",
+              "            } catch (Exception e) {",
+              "                try {",
+              "                    getContext().getContentResolver().takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);",
+              "                } catch (Exception ignored) {}",
+              "            }",
+              "            String content;",
+              "            try (InputStream is = getContext().getContentResolver().openInputStream(uri)) {",
+              "                if (is == null) {",
+              "                    call.reject(\"Không thể đọc nội dung tệp từ bộ nhớ điện thoại\");",
+              "                    return;",
+              "                }",
+              "                ByteArrayOutputStream buffer = new ByteArrayOutputStream();",
+              "                byte[] chunk = new byte[8192];",
+              "                int n;",
+              "                while ((n = is.read(chunk)) != -1) {",
+              "                    buffer.write(chunk, 0, n);",
+              "                }",
+              "                content = buffer.toString(StandardCharsets.UTF_8.name());",
+              "            }",
+              "            JSObject ret = new JSObject();",
+              "            ret.put(\"cancelled\", false);",
+              "            ret.put(\"uri\", uri.toString());",
+              "            ret.put(\"name\", queryDisplayName(uri));",
+              "            ret.put(\"content\", content);",
+              "            ret.put(\"writable\", isUriWritable(uri));",
+              "            call.resolve(ret);",
+              "        } catch (Exception e) {",
+              "            call.reject(\"Lỗi đọc tệp: \" + e.getMessage(), e);",
+              "        }",
+              "    }",
+              "",
+              "    @PluginMethod",
+              "    public void writeDocument(PluginCall call) {",
+              "        String uriStr = call.getString(\"uri\");",
+              "        String content = call.getString(\"content\", \"\");",
+              "        if (uriStr == null || uriStr.trim().isEmpty()) {",
+              "            call.reject(\"Thiếu URI tệp cần ghi đè\");",
+              "            return;",
+              "        }",
+              "        try {",
+              "            Uri uri = Uri.parse(uriStr);",
+              "            writeTextToUri(uri, content != null ? content : \"\");",
+              "            JSObject ret = new JSObject();",
+              "            ret.put(\"ok\", true);",
+              "            ret.put(\"uri\", uriStr);",
+              "            ret.put(\"name\", queryDisplayName(uri));",
+              "            call.resolve(ret);",
+              "        } catch (Exception e) {",
+              "            call.reject(\"Không thể ghi đè trực tiếp tệp trên máy: \" + e.getMessage(), e);",
+              "        }",
+              "    }",
+              "",
+              "    @PluginMethod",
+              "    public void createDocument(PluginCall call) {",
+              "        try {",
+              "            String fileName = call.getString(\"fileName\", \"main.py\");",
+              "            String mimeType = call.getString(\"mimeType\", \"text/plain\");",
+              "            Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);",
+              "            intent.addCategory(Intent.CATEGORY_OPENABLE);",
+              "            intent.setType(mimeType);",
+              "            intent.putExtra(Intent.EXTRA_TITLE, fileName);",
+              "            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);",
+              "            startActivityForResult(call, intent, \"handleCreateDocumentResult\");",
+              "        } catch (Exception e) {",
+              "            call.reject(\"Không thể mở hộp thoại lưu tệp: \" + e.getMessage(), e);",
+              "        }",
+              "    }",
+              "",
+              "    @ActivityCallback",
+              "    private void handleCreateDocumentResult(PluginCall call, ActivityResult result) {",
+              "        if (call == null) return;",
+              "        if (result.getResultCode() != Activity.RESULT_OK || result.getData() == null || result.getData().getData() == null) {",
+              "            JSObject cancelled = new JSObject();",
+              "            cancelled.put(\"cancelled\", true);",
+              "            call.resolve(cancelled);",
+              "            return;",
+              "        }",
+              "        Uri uri = result.getData().getData();",
+              "        String content = call.getString(\"content\", \"\");",
+              "        String base64 = call.getString(\"base64\");",
+              "        try {",
+              "            try {",
+              "                getContext().getContentResolver().takePersistableUriPermission(",
+              "                    uri,",
+              "                    Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION",
+              "                );",
+              "            } catch (Exception ignored) {}",
+              "            if (base64 != null && !base64.isEmpty()) {",
+              "                byte[] raw = android.util.Base64.decode(base64, android.util.Base64.DEFAULT);",
+              "                try (OutputStream os = getContext().getContentResolver().openOutputStream(uri, \"w\")) {",
+              "                    if (os == null) throw new IllegalStateException(\"Cannot open output stream\");",
+              "                    os.write(raw);",
+              "                    os.flush();",
+              "                }",
+              "            } else {",
+              "                writeTextToUri(uri, content != null ? content : \"\");",
+              "            }",
+              "            JSObject ret = new JSObject();",
+              "            ret.put(\"cancelled\", false);",
+              "            ret.put(\"uri\", uri.toString());",
+              "            ret.put(\"name\", queryDisplayName(uri));",
+              "            call.resolve(ret);",
+              "        } catch (Exception e) {",
+              "            call.reject(\"Không thể lưu tệp vào vị trí đã chọn: \" + e.getMessage(), e);",
+              "        }",
+              "    }",
+              "}",
+              ""
+            ];
+            fs.writeFileSync(nativePluginPath, pluginLines.join("\n"), "utf8");
+
+            const mainAct = "android/app/src/main/java/org/pydroid3/web/MainActivity.java";
+            if (fs.existsSync(mainAct)) {
+              const lines = [
+                "package org.pydroid3.web;",
+                "",
+                "import android.annotation.TargetApi;",
+                "import android.graphics.Color;",
+                "import android.os.Build;",
+                "import android.os.Bundle;",
+                "import android.view.View;",
+                "import android.view.ViewGroup;",
+                "import android.webkit.RenderProcessGoneDetail;",
+                "import android.webkit.WebView;",
+                "import androidx.core.graphics.Insets;",
+                "import androidx.core.view.ViewCompat;",
+                "import androidx.core.view.WindowCompat;",
+                "import androidx.core.view.WindowInsetsCompat;",
+                "import com.getcapacitor.BridgeActivity;",
+                "import com.getcapacitor.BridgeWebViewClient;",
+                "",
+                "public class MainActivity extends BridgeActivity {",
+                "    private static long lastRendererRecoverMs = 0L;",
+                "",
+                "    @Override",
+                "    protected void onCreate(Bundle savedInstanceState) {",
+                "        registerPlugin(NativeStoragePlugin.class);",
+                "        super.onCreate(savedInstanceState);",
+                "        if (getBridge() != null && getBridge().getWebView() != null) {",
+                "            getBridge().getWebView().setWebViewClient(new BridgeWebViewClient(getBridge()) {",
+                "                @Override",
+                "                @TargetApi(Build.VERSION_CODES.O)",
+                "                public boolean onRenderProcessGone(WebView view, RenderProcessGoneDetail detail) {",
+                "                    if (view != null) {",
+                "                        if (view.getParent() instanceof ViewGroup) {",
+                "                            ((ViewGroup) view.getParent()).removeView(view);",
+                "                        }",
+                "                        try {",
+                "                            view.destroy();",
+                "                        } catch (Exception ignored) {}",
+                "                    }",
+                "                    long now = System.currentTimeMillis();",
+                "                    if (now - lastRendererRecoverMs > 3000L && !isFinishing() && !isDestroyed()) {",
+                "                        lastRendererRecoverMs = now;",
+                "                        runOnUiThread(() -> {",
+                "                            try {",
+                "                                recreate();",
+                "                            } catch (Exception ignored) {}",
+                "                        });",
+                "                    }",
+                "                    return true;",
+                "                }",
+                "            });",
+                "        }",
+                "        WindowCompat.setDecorFitsSystemWindows(getWindow(), true);",
+                "        getWindow().setStatusBarColor(Color.parseColor(\"#070b14\"));",
+                "        getWindow().setNavigationBarColor(Color.parseColor(\"#070b14\"));",
+                "        View content = findViewById(android.R.id.content);",
+                "        if (content != null) {",
+                "            content.setBackgroundColor(Color.parseColor(\"#070b14\"));",
+                "            ViewCompat.setOnApplyWindowInsetsListener(content, (v, windowInsets) -> {",
+                "                Insets bars = windowInsets.getInsets(WindowInsetsCompat.Type.systemBars());",
+                "                v.setPadding(bars.left, bars.top, bars.right, bars.bottom);",
+                "                return WindowInsetsCompat.CONSUMED;",
+                "            });",
+                "        }",
+                "    }",
+                "}",
+                ""
+              ];
+              fs.writeFileSync(mainAct, lines.join("\n"), "utf8");
+            }
+          '
+
+      - name: 8. Cấp quyền thực thi cho Gradle
+        run: |
+          chmod +x android/gradlew || true
+
+      - name: 9. Xây dựng tệp APK Android
+        run: |
+          cd android && ./gradlew assembleDebug --stacktrace
+
+      - name: 10. Tìm và xác minh tệp APK đã tạo
+        run: |
+          ls -la android/app/build/outputs/apk/debug/
+
+      - name: 11. Tải lên file APK (Tải xuống trên điện thoại)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Pydroid3-Web-Debug-APK
+          path: android/app/build/outputs/apk/debug/*.apk
+          retention-days: 14

@@ -1,0 +1,19 @@
+{
+  "appId": "org.pydroid3.web",
+  "appName": "Pydroid 3 Web",
+  "webDir": "dist",
+  "server": {
+    "androidScheme": "https",
+    "cleartext": true
+  },
+  "android": {
+    "allowMixedContent": true
+  },
+  "plugins": {
+    "StatusBar": {
+      "overlaysWebView": false,
+      "backgroundColor": "#11131a",
+      "style": "DARK"
+    }
+  }
+}
