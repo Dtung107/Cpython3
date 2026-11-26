@@ -34,9 +34,20 @@ app.use((req, res, next) => {
 
 app.use(express.json({ limit: '10mb' }));
 
-function getGeminiClient(customApiKey?: string, timeoutMs = 12000): GoogleGenAI {
-  const apiKey = (customApiKey && customApiKey.trim()) || process.env.GEMINI_API_KEY;
-  if (!apiKey || apiKey.trim() === '' || apiKey === 'MY_GEMINI_API_KEY') {
+function normalizeApiKey(raw?: string): string {
+  if (!raw || typeof raw !== 'string') return '';
+  return raw.trim().replace(/^["']+|["']+$/g, '').trim();
+}
+
+function isUsableApiKey(key: string): boolean {
+  return !!key && key !== 'MY_GEMINI_API_KEY' && key !== 'undefined' && key !== 'null';
+}
+
+function getGeminiClient(customApiKey?: string, timeoutMs = 25000): GoogleGenAI {
+  const custom = normalizeApiKey(customApiKey);
+  const envKey = normalizeApiKey(process.env.GEMINI_API_KEY);
+  const apiKey = isUsableApiKey(custom) ? custom : envKey;
+  if (!isUsableApiKey(apiKey)) {
     throw new Error(
       'Chưa thiết lập Gemini API Key. Bạn vui lòng mở bảng Settings > Secrets trong giao diện AI Studio để chọn khóa miễn phí hoặc nhập khóa trong Cài đặt API Key.'
     );
@@ -50,6 +61,105 @@ function getGeminiClient(customApiKey?: string, timeoutMs = 12000): GoogleGenAI 
       timeout: timeoutMs,
     },
   });
+}
+
+function getGeminiClientCandidates(customApiKey?: string, timeoutMs = 25000): GoogleGenAI[] {
+  const custom = normalizeApiKey(customApiKey);
+  const envKey = normalizeApiKey(process.env.GEMINI_API_KEY);
+  const keys: string[] = [];
+  if (isUsableApiKey(custom)) keys.push(custom);
+  if (isUsableApiKey(envKey) && envKey !== custom) keys.push(envKey);
+  if (keys.length === 0) {
+    throw new Error(
+      'Chưa thiết lập Gemini API Key. Bạn vui lòng mở bảng Settings > Secrets trong giao diện AI Studio để chọn khóa miễn phí hoặc nhập khóa trong Cài đặt API Key.'
+    );
+  }
+  return keys.map(
+    (apiKey) =>
+      new GoogleGenAI({
+        apiKey,
+        httpOptions: {
+          headers: {
+            'User-Agent': 'aistudio-build',
+          },
+          timeout: timeoutMs,
+        },
+      })
+  );
+}
+
+function isGeminiAuthError(msg: string): boolean {
+  return (
+    msg.includes('PERMISSION_DENIED') ||
+    msg.includes('ACCESS_TOKEN_SCOPE_INSUFFICIENT') ||
+    msg.includes('API_KEY_INVALID') ||
+    msg.includes('API key should be set') ||
+    msg.includes('API key not valid')
+  );
+}
+
+function formatFriendlyGeminiError(err: any, fallbackText: string): string {
+  const msg = err?.message || String(err || '');
+  if (isGeminiAuthError(msg)) {
+    return 'Khóa Gemini API chưa hợp lệ hoặc chưa được cấu hình. Vui lòng kiểm tra Settings > Secrets hoặc Khóa API.';
+  }
+  if (msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED')) {
+    return 'Hệ thống AI đang tạm thời đạt giới hạn lưu lượng (429). Vui lòng thử lại sau ít phút.';
+  }
+  if (msg.includes('503') || msg.includes('high demand') || msg.includes('UNAVAILABLE')) {
+    return 'Hệ thống AI đang quá tải tạm thời (503). Vui lòng thử lại sau giây lát.';
+  }
+  if (msg.includes('404') || msg.includes('NOT_FOUND')) {
+    return 'Model AI được yêu cầu hiện không khả dụng với khóa API này (404). Vui lòng kiểm tra lại cấu hình.';
+  }
+  if (msg.includes('AbortError') || msg.includes('DEADLINE_EXCEEDED') || msg.includes('504') || msg.includes('timed out')) {
+    return 'Máy chủ Gemini AI phản hồi quá thời gian chờ (504). Vui lòng thử lại sau giây lát.';
+  }
+  if (msg.includes('400') || msg.includes('INVALID_ARGUMENT')) {
+    return `Yêu cầu AI không hợp lệ (400): ${msg.slice(0, 140)}`;
+  }
+  return fallbackText;
+}
+
+function normalizeChatContents(messages: any[]): { role: 'user' | 'model'; parts: { text: string }[] }[] {
+  const turns: { role: 'user' | 'model'; parts: { text: string }[] }[] = [];
+  for (const m of Array.isArray(messages) ? messages : []) {
+    const text = typeof m?.content === 'string' ? m.content.trim() : '';
+    if (!text) continue;
+    const role: 'user' | 'model' = m?.role === 'assistant' || m?.role === 'model' ? 'model' : 'user';
+    // Gemini multi-turn conversations must begin with a user turn
+    if (turns.length === 0 && role === 'model') {
+      continue;
+    }
+    const prev = turns[turns.length - 1];
+    if (prev && prev.role === role) {
+      prev.parts[0].text += `\n\n${text}`;
+    } else {
+      turns.push({ role, parts: [{ text }] });
+    }
+  }
+  return turns;
+}
+
+function buildModelConfig(
+  model: string,
+  baseConfig: Record<string, any> = {},
+  thinkingLevel: ThinkingLevel = ThinkingLevel.LOW
+): Record<string, any> {
+  const nextConfig: Record<string, any> = { ...baseConfig };
+  if (model === 'gemini-4-hydrogen') {
+    // gemini-4-hydrogen supports LOW/MEDIUM/HIGH/XHIGH (MINIMAL returns 400)
+    nextConfig.thinkingConfig = {
+      thinkingLevel: thinkingLevel === ThinkingLevel.MINIMAL ? ThinkingLevel.LOW : thinkingLevel,
+    };
+  } else if (model === 'gemini-3.1-flash-lite') {
+    nextConfig.thinkingConfig = {
+      thinkingLevel: ThinkingLevel.MINIMAL,
+    };
+  } else if (nextConfig.thinkingConfig) {
+    delete nextConfig.thinkingConfig;
+  }
+  return nextConfig;
 }
 
 // Track model quota/overload cooldowns in-memory to skip slow/unavailable models immediately
@@ -67,6 +177,9 @@ function getOrderedModels(preferredModels: string[]): string[] {
 
 function recordModelCooldown(model: string, err: any) {
   const msg = err?.message || String(err);
+  if (msg.includes('400') || msg.includes('INVALID_ARGUMENT') || msg.includes('AbortError')) {
+    return;
+  }
   const isQuotaExceeded =
     msg.includes('429') ||
     msg.includes('RESOURCE_EXHAUSTED') ||
@@ -87,9 +200,9 @@ function recordModelCooldown(model: string, err: any) {
     return;
   }
 
-  // Cooldown 503/504/timeout models for 2 minutes so subsequent requests don't stall
-  modelQuotaCooldown[model] = Date.now() + 2 * 60 * 1000;
-  console.log(`[Gemini] Model ${model} is busy/slow, switching to fast backup model.`);
+  // Cooldown 503/504/404 models for 60s so subsequent requests don't stall
+  modelQuotaCooldown[model] = Date.now() + 60 * 1000;
+  console.log(`[Gemini] Model ${model} failed (${msg.slice(0, 140)}), switching to backup model.`);
 }
 
 // Resilient Gemini Call with Smart Model Fallback (Handles transient 503/429/504 spikes smoothly)
@@ -101,57 +214,58 @@ async function callGeminiWithFallback(params: {
   thinkingLevel?: ThinkingLevel;
   timeoutMs?: number;
 }): Promise<string> {
-  const ai = getGeminiClient(params.customApiKey, params.timeoutMs || 12000);
+  const clients = getGeminiClientCandidates(params.customApiKey, params.timeoutMs || 25000);
 
   // Order fast, high-availability models from gemini_api skill
   const models = getOrderedModels([
-    params.preferredModel || 'gemini-3.1-flash-lite',
-    'gemini-3.1-flash-lite',
+    params.preferredModel || 'gemini-4-hydrogen',
     'gemini-4-hydrogen',
+    'gemini-3.1-flash-lite',
   ]);
 
   let lastErr: any = null;
 
-  for (const model of models) {
-    try {
-      const configToUse = { ...params.config };
-      if (model === 'gemini-4-hydrogen') {
-        configToUse.thinkingConfig = configToUse.thinkingConfig || {
-          thinkingLevel: params.thinkingLevel || ThinkingLevel.MINIMAL,
-        };
-      } else if (configToUse.thinkingConfig) {
-        delete configToUse.thinkingConfig;
-      }
-
-      const response = await ai.models.generateContent({
-        model,
-        contents: params.contents,
-        config: configToUse,
-      });
-
-      if (response && response.text) {
-        return response.text;
-      }
-    } catch (err: any) {
-      lastErr = err;
-      const msg = err?.message || String(err);
-
-      const isAuthError =
-        msg.includes('PERMISSION_DENIED') ||
-        msg.includes('ACCESS_TOKEN_SCOPE_INSUFFICIENT') ||
-        msg.includes('API_KEY_INVALID') ||
-        msg.includes('API key should be set') ||
-        msg.includes('API key not valid');
-
-      if (isAuthError) {
-        throw new Error(
-          'Chưa thiết lập Gemini API Key. Bạn vui lòng mở bảng Settings > Secrets trong giao diện Google AI Studio để chọn hoặc kích hoạt khóa API miễn phí.'
+  for (const ai of clients) {
+    let sawAuthErrorForClient = false;
+    for (const model of models) {
+      try {
+        const configToUse = buildModelConfig(
+          model,
+          params.config,
+          params.thinkingLevel || ThinkingLevel.LOW
         );
-      }
 
-      recordModelCooldown(model, err);
-      continue;
+        const response = await ai.models.generateContent({
+          model,
+          contents: params.contents,
+          config: configToUse,
+        });
+
+        if (response && response.text) {
+          return response.text;
+        }
+      } catch (err: any) {
+        lastErr = err;
+        const msg = err?.message || String(err);
+
+        if (isGeminiAuthError(msg)) {
+          sawAuthErrorForClient = true;
+          break;
+        }
+
+        recordModelCooldown(model, err);
+        continue;
+      }
     }
+    if (!sawAuthErrorForClient) {
+      break;
+    }
+  }
+
+  if (lastErr && isGeminiAuthError(lastErr?.message || String(lastErr))) {
+    throw new Error(
+      'Khóa Gemini API chưa hợp lệ hoặc chưa được cấu hình. Bạn vui lòng mở bảng Settings > Secrets trong giao diện Google AI Studio để chọn khóa API miễn phí hoặc kiểm tra lại Khóa API.'
+    );
   }
 
   throw lastErr || new Error('Không thể nhận phản hồi từ Gemini AI. Vui lòng thử lại sau.');
@@ -161,11 +275,13 @@ async function callGeminiWithFallback(params: {
 app.post('/api/gemini/validate', async (req, res) => {
   try {
     const { apiKey } = req.body;
-    const keyToTest = (apiKey && typeof apiKey === 'string' && apiKey.trim())
-      ? apiKey.trim()
-      : (req.headers['x-gemini-api-key'] as string) || process.env.GEMINI_API_KEY;
+    const rawCandidate =
+      (apiKey && typeof apiKey === 'string' && apiKey.trim()) ||
+      (req.headers['x-gemini-api-key'] as string) ||
+      process.env.GEMINI_API_KEY;
+    const keyToTest = normalizeApiKey(rawCandidate);
 
-    if (!keyToTest || keyToTest === 'MY_GEMINI_API_KEY') {
+    if (!isUsableApiKey(keyToTest)) {
       return res.status(400).json({
         valid: false,
         error: 'Khóa API không được để trống.',
@@ -189,10 +305,7 @@ app.post('/api/gemini/validate', async (req, res) => {
     try {
       const result = await Promise.any(
         candidateModels.map(async (model) => {
-          const config: any = { maxOutputTokens: 1 };
-          if (model === 'gemini-4-hydrogen') {
-            config.thinkingConfig = { thinkingLevel: ThinkingLevel.MINIMAL };
-          }
+          const config = buildModelConfig(model, { maxOutputTokens: 1 }, ThinkingLevel.LOW);
           const pingResponse = await testAi.models.generateContent({
             model,
             contents: 'ping',
@@ -346,11 +459,13 @@ app.post('/api/gemini/debug', async (req, res) => {
     const isStreaming = req.headers.accept?.includes('text/event-stream') || stream === true;
 
     if (isStreaming) {
+      const clients = getGeminiClientCandidates(customApiKey, 25000);
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
       res.setHeader('X-Accel-Buffering', 'no');
       res.flushHeaders?.();
+      res.write(': connected\n\n');
 
       const streamPrompt = `Phân tích đoạn mã Python sau và trả lời ĐÚNG theo cấu trúc các thẻ sau (không thêm chữ thừa ngoài thẻ, viết hoàn toàn bằng tiếng Việt):
 
@@ -375,109 +490,125 @@ ${code}
 ${errorOutput || '(Người dùng yêu cầu kiểm tra cú pháp và tối ưu trước khi chạy)'}
 ${context ? `\n--- NGỮ CẢNH BỔ SUNG: ${context} ---` : ''}`;
 
-      const ai = getGeminiClient(customApiKey);
       const streamModels = getOrderedModels([
-        'gemini-3.1-flash-lite',
         'gemini-4-hydrogen',
+        'gemini-3.1-flash-lite',
       ]);
 
       let streamSucceeded = false;
       let lastStreamErr: any = null;
+      let clientClosed = false;
+      res.on('close', () => {
+        if (!res.writableEnded) {
+          clientClosed = true;
+        }
+      });
 
-      for (const model of streamModels) {
-        let rawAccumulated = '';
-        let sentAnyChunk = false;
-        try {
-          const config: any = {
-            systemInstruction:
-              'Bạn là chuyên gia gỡ lỗi Python trong Pydroid 3 IDE. Luôn xuất đúng thứ tự 6 thẻ <<<ERRORTYPE>>>, <<<LINENUMBER>>>, <<<SUMMARY>>>, <<<EXPLANATION>>>, <<<FIXEDCODE>>>, <<<SUGGESTIONS>>> bằng tiếng Việt.',
-          };
-          if (model === 'gemini-4-hydrogen') {
-            config.thinkingConfig = { thinkingLevel: ThinkingLevel.MINIMAL };
-          }
-
-          const responseStream = await ai.models.generateContentStream({
-            model,
-            contents: streamPrompt,
-            config,
-          });
-
-          let lastEmittedHash = '';
-          for await (const chunk of responseStream) {
-            const text = chunk.text;
-            if (!text) continue;
-            rawAccumulated += text;
-            const parsed = parseTaggedDebugOutput(rawAccumulated, '');
-            const hasContent = !!(
-              parsed.errorType ||
-              parsed.summary ||
-              parsed.explanation ||
-              parsed.fixedCode ||
-              parsed.suggestions.length > 0
+      for (const ai of clients) {
+        let sawAuthErrorForClient = false;
+        for (const model of streamModels) {
+          if (clientClosed) return res.end();
+          let rawAccumulated = '';
+          let sentAnyChunk = false;
+          const firstChunkAbort = new AbortController();
+          const firstChunkTimer = setTimeout(() => {
+            if (!sentAnyChunk) firstChunkAbort.abort();
+          }, 14000);
+          try {
+            const config = buildModelConfig(
+              model,
+              {
+                systemInstruction:
+                  'Bạn là chuyên gia gỡ lỗi Python trong Pydroid 3 IDE. Luôn xuất đúng thứ tự 6 thẻ <<<ERRORTYPE>>>, <<<LINENUMBER>>>, <<<SUMMARY>>>, <<<EXPLANATION>>>, <<<FIXEDCODE>>>, <<<SUGGESTIONS>>> bằng tiếng Việt.',
+                abortSignal: firstChunkAbort.signal,
+              },
+              ThinkingLevel.LOW
             );
-            if (hasContent) {
-              const snapshot = JSON.stringify(parsed);
-              if (snapshot !== lastEmittedHash) {
-                lastEmittedHash = snapshot;
-                sentAnyChunk = true;
-                res.write(`data: ${JSON.stringify({ partial: parsed })}\n\n`);
+
+            const responseStream = await ai.models.generateContentStream({
+              model,
+              contents: streamPrompt,
+              config,
+            });
+
+            let lastEmittedHash = '';
+            for await (const chunk of responseStream) {
+              if (clientClosed) {
+                clearTimeout(firstChunkTimer);
+                return res.end();
+              }
+              const text = chunk.text;
+              if (!text) continue;
+              clearTimeout(firstChunkTimer);
+              rawAccumulated += text;
+              const parsed = parseTaggedDebugOutput(rawAccumulated, '');
+              const hasContent = !!(
+                parsed.errorType ||
+                parsed.summary ||
+                parsed.explanation ||
+                parsed.fixedCode ||
+                parsed.suggestions.length > 0
+              );
+              if (hasContent) {
+                const snapshot = JSON.stringify(parsed);
+                if (snapshot !== lastEmittedHash) {
+                  lastEmittedHash = snapshot;
+                  sentAnyChunk = true;
+                  res.write(`data: ${JSON.stringify({ partial: parsed })}\n\n`);
+                }
               }
             }
-          }
+            clearTimeout(firstChunkTimer);
+            if (!rawAccumulated.trim()) {
+              throw new Error('Empty stream response');
+            }
 
-          const finalParsed = parseTaggedDebugOutput(rawAccumulated, code);
-          const finalResult: ParsedDebugPayload = {
-            summary: finalParsed.summary || 'Đã hoàn tất phân tích mã nguồn.',
-            errorType: finalParsed.errorType || 'Code Analysis',
-            lineNumber: finalParsed.lineNumber || 0,
-            explanation: finalParsed.explanation || rawAccumulated.trim() || 'Không có giải thích chi tiết.',
-            fixedCode: finalParsed.fixedCode || code,
-            suggestions: finalParsed.suggestions,
-          };
-
-          res.write(`data: ${JSON.stringify({ done: true, result: finalResult })}\n\n`);
-          streamSucceeded = true;
-          return res.end();
-        } catch (err: any) {
-          lastStreamErr = err;
-          const msg = err?.message || String(err);
-          const isAuthError =
-            msg.includes('PERMISSION_DENIED') ||
-            msg.includes('ACCESS_TOKEN_SCOPE_INSUFFICIENT') ||
-            msg.includes('API_KEY_INVALID') ||
-            msg.includes('API key should be set') ||
-            msg.includes('API key not valid');
-
-          if (isAuthError) {
-            res.write(
-              `data: ${JSON.stringify({
-                error: 'Chưa thiết lập hoặc khóa Gemini API không hợp lệ. Vui lòng kiểm tra Settings API Key.',
-              })}\n\n`
-            );
-            return res.end();
-          }
-
-          if (sentAnyChunk) {
             const finalParsed = parseTaggedDebugOutput(rawAccumulated, code);
-            res.write(`data: ${JSON.stringify({ done: true, result: finalParsed })}\n\n`);
-            return res.end();
-          }
+            const finalResult: ParsedDebugPayload = {
+              summary: finalParsed.summary || 'Đã hoàn tất phân tích mã nguồn.',
+              errorType: finalParsed.errorType || 'Code Analysis',
+              lineNumber: finalParsed.lineNumber || 0,
+              explanation: finalParsed.explanation || rawAccumulated.trim() || 'Không có giải thích chi tiết.',
+              fixedCode: finalParsed.fixedCode || code,
+              suggestions: finalParsed.suggestions,
+            };
 
-          recordModelCooldown(model, err);
-          continue;
+            res.write(`data: ${JSON.stringify({ done: true, result: finalResult })}\n\n`);
+            streamSucceeded = true;
+            return res.end();
+          } catch (err: any) {
+            clearTimeout(firstChunkTimer);
+            lastStreamErr = err;
+            const msg = err?.message || String(err);
+            console.error(`[Gemini /api/gemini/debug stream] model=${model}:`, msg.slice(0, 220));
+
+            if (isGeminiAuthError(msg)) {
+              sawAuthErrorForClient = true;
+              break;
+            }
+
+            if (sentAnyChunk) {
+              const finalParsed = parseTaggedDebugOutput(rawAccumulated, code);
+              res.write(`data: ${JSON.stringify({ done: true, result: finalParsed })}\n\n`);
+              return res.end();
+            }
+
+            recordModelCooldown(model, err);
+            continue;
+          }
         }
+        if (!sawAuthErrorForClient) break;
       }
 
-      if (!streamSucceeded) {
-        const errMsg = lastStreamErr?.message || '';
-        const friendly =
-          errMsg.includes('429') || errMsg.includes('RESOURCE_EXHAUSTED')
-            ? 'Hệ thống AI đang tạm thời đạt giới hạn lưu lượng (429). Vui lòng thử lại sau ít phút.'
-            : 'Không thể kết nối đến Gemini AI lúc này. Vui lòng thử lại sau giây lát.';
+      if (!streamSucceeded && !clientClosed) {
+        const friendly = formatFriendlyGeminiError(
+          lastStreamErr,
+          'Không thể kết nối đến Gemini AI lúc này. Vui lòng thử lại sau giây lát.'
+        );
         res.write(`data: ${JSON.stringify({ error: friendly })}\n\n`);
         return res.end();
       }
-      return;
+      return res.end();
     }
 
     const prompt = `Bạn là Trợ lý gỡ lỗi AI chuyên nghiệp của Pydroid 3 Web, giao diện tiếng Việt.
@@ -546,9 +677,14 @@ Nhiệm vụ của bạn:
     return res.json({ success: true, ...result });
   } catch (error: any) {
     console.error('Error calling Gemini debug:', error);
-    return res.status(500).json({
-      error: error?.message || 'Không thể kết nối đến Gemini AI. Vui lòng thử lại.',
-    });
+    const errMsg = error?.message || 'Không thể kết nối đến Gemini AI. Vui lòng thử lại.';
+    if (res.headersSent) {
+      try {
+        res.write(`data: ${JSON.stringify({ error: errMsg })}\n\n`);
+      } catch {}
+      return res.end();
+    }
+    return res.status(500).json({ error: errMsg });
   }
 });
 
@@ -572,84 +708,104 @@ app.post('/api/gemini/explain', async (req, res) => {
     const isStreaming = req.headers.accept?.includes('text/event-stream') || stream === true;
 
     if (isStreaming) {
+      const clients = getGeminiClientCandidates(customApiKey, 25000);
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
       res.setHeader('X-Accel-Buffering', 'no');
       res.flushHeaders?.();
+      res.write(': connected\n\n');
 
-      const ai = getGeminiClient(customApiKey);
       const streamModels = getOrderedModels([
-        'gemini-3.1-flash-lite',
         'gemini-4-hydrogen',
+        'gemini-3.1-flash-lite',
       ]);
 
       let streamSucceeded = false;
       let lastStreamErr: any = null;
-
-      for (const model of streamModels) {
-        let sentAnyChunk = false;
-        try {
-          const config: any = { systemInstruction };
-          if (model === 'gemini-4-hydrogen') {
-            config.thinkingConfig = { thinkingLevel: ThinkingLevel.MINIMAL };
-          }
-
-          const responseStream = await ai.models.generateContentStream({
-            model,
-            contents: prompt,
-            config,
-          });
-
-          for await (const chunk of responseStream) {
-            const text = chunk.text;
-            if (text) {
-              sentAnyChunk = true;
-              res.write(`data: ${JSON.stringify({ chunk: text })}\n\n`);
-            }
-          }
-          res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
-          streamSucceeded = true;
-          return res.end();
-        } catch (err: any) {
-          lastStreamErr = err;
-          const msg = err?.message || String(err);
-          const isAuthError =
-            msg.includes('PERMISSION_DENIED') ||
-            msg.includes('ACCESS_TOKEN_SCOPE_INSUFFICIENT') ||
-            msg.includes('API_KEY_INVALID') ||
-            msg.includes('API key should be set') ||
-            msg.includes('API key not valid');
-
-          if (isAuthError) {
-            res.write(
-              `data: ${JSON.stringify({
-                error: 'Khóa Gemini API chưa hợp lệ hoặc chưa được cấu hình. Vui lòng kiểm tra Settings API Key.',
-              })}\n\n`
-            );
-            return res.end();
-          }
-
-          if (sentAnyChunk) {
-            res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
-            return res.end();
-          }
-
-          recordModelCooldown(model, err);
-          continue;
+      let clientClosed = false;
+      res.on('close', () => {
+        if (!res.writableEnded) {
+          clientClosed = true;
         }
+      });
+
+      for (const ai of clients) {
+        let sawAuthErrorForClient = false;
+        for (const model of streamModels) {
+          if (clientClosed) return res.end();
+          let sentAnyChunk = false;
+          const firstChunkAbort = new AbortController();
+          const firstChunkTimer = setTimeout(() => {
+            if (!sentAnyChunk) firstChunkAbort.abort();
+          }, 14000);
+          try {
+            const config = buildModelConfig(
+              model,
+              {
+                systemInstruction,
+                abortSignal: firstChunkAbort.signal,
+              },
+              ThinkingLevel.LOW
+            );
+
+            const responseStream = await ai.models.generateContentStream({
+              model,
+              contents: prompt,
+              config,
+            });
+
+            for await (const chunk of responseStream) {
+              if (clientClosed) {
+                clearTimeout(firstChunkTimer);
+                return res.end();
+              }
+              const text = chunk.text;
+              if (text) {
+                clearTimeout(firstChunkTimer);
+                sentAnyChunk = true;
+                res.write(`data: ${JSON.stringify({ chunk: text })}\n\n`);
+              }
+            }
+            clearTimeout(firstChunkTimer);
+            if (!sentAnyChunk) {
+              throw new Error('Empty stream response');
+            }
+            res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+            streamSucceeded = true;
+            return res.end();
+          } catch (err: any) {
+            clearTimeout(firstChunkTimer);
+            lastStreamErr = err;
+            const msg = err?.message || String(err);
+            console.error(`[Gemini /api/gemini/explain stream] model=${model}:`, msg.slice(0, 220));
+
+            if (isGeminiAuthError(msg)) {
+              sawAuthErrorForClient = true;
+              break;
+            }
+
+            if (sentAnyChunk) {
+              res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+              return res.end();
+            }
+
+            recordModelCooldown(model, err);
+            continue;
+          }
+        }
+        if (!sawAuthErrorForClient) break;
       }
 
-      if (!streamSucceeded) {
-        const errMsg = lastStreamErr?.message || '';
-        const friendly =
-          errMsg.includes('429') || errMsg.includes('RESOURCE_EXHAUSTED')
-            ? 'Hệ thống AI đang tạm thời đạt giới hạn lưu lượng (429). Vui lòng thử lại sau ít phút.'
-            : 'Không thể phân tích đoạn mã lúc này. Vui lòng thử lại sau giây lát.';
+      if (!streamSucceeded && !clientClosed) {
+        const friendly = formatFriendlyGeminiError(
+          lastStreamErr,
+          'Không thể phân tích đoạn mã lúc này. Vui lòng thử lại sau giây lát.'
+        );
         res.write(`data: ${JSON.stringify({ error: friendly })}\n\n`);
         return res.end();
       }
-      return;
+      return res.end();
     }
 
     const explanation = await callGeminiWithFallback({
@@ -663,9 +819,14 @@ app.post('/api/gemini/explain', async (req, res) => {
     return res.json({ success: true, explanation: explanation || '' });
   } catch (error: any) {
     console.error('Error calling Gemini explain:', error);
-    return res.status(500).json({
-      error: error?.message || 'Không thể phân tích đoạn mã. Vui lòng kiểm tra lại.',
-    });
+    const errMsg = error?.message || 'Không thể phân tích đoạn mã. Vui lòng kiểm tra lại.';
+    if (res.headersSent) {
+      try {
+        res.write(`data: ${JSON.stringify({ error: errMsg })}\n\n`);
+      } catch {}
+      return res.end();
+    }
+    return res.status(500).json({ error: errMsg });
   }
 });
 
@@ -759,10 +920,15 @@ app.post('/api/gemini/chat', async (req, res) => {
     const { messages = [], currentCode = '', stream = false } = req.body;
     const customApiKey = (req.headers['x-gemini-api-key'] as string) || req.body?.apiKey;
 
-    const formattedContents = messages.map((m: any) => ({
-      role: m.role === 'assistant' ? 'model' : 'user',
-      parts: [{ text: m.content || '' }],
-    }));
+    const formattedContents = normalizeChatContents(messages);
+    if (formattedContents.length === 0) {
+      return res.status(400).json({ error: 'Nội dung tin nhắn không được để trống.' });
+    }
+
+    const trimmedCode =
+      typeof currentCode === 'string' && currentCode.length > 4000
+        ? currentCode.slice(0, 4000)
+        : currentCode;
 
     const systemInstruction = `Bạn là Trợ lý Lập Trình Python AI của Pydroid 3 Web (môi trường lập trình tối ưu cho Android).
 Nhiệm vụ của bạn là hỗ trợ lập trình viên di động:
@@ -771,94 +937,149 @@ Nhiệm vụ của bạn là hỗ trợ lập trình viên di động:
 - Hỗ trợ các thư viện: NumPy, Matplotlib, Kivy (cho Android APK), Pyodide, Requests, v.v.
 - Khi người dùng gửi mã hoặc hỏi cách làm, luôn đưa ra đoạn mã rõ ràng có khối \`\`\`python ... \`\`\`.
 - Luôn giao tiếp bằng tiếng Việt lịch sự, thân thiện và khuyến khích.
-${currentCode ? `\n\n[MÃ NGUỒN HIỆN TẠI TRONG EDITOR]:\n\`\`\`python\n${currentCode}\n\`\`\`` : ''}`;
+${trimmedCode ? `\n\n[MÃ NGUỒN HIỆN TẠI TRONG EDITOR]:\n\`\`\`python\n${trimmedCode}\n\`\`\`` : ''}`;
 
     const isStreaming = req.headers.accept?.includes('text/event-stream') || stream === true;
 
     if (isStreaming) {
+      const clients = getGeminiClientCandidates(customApiKey, 25000);
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
       res.setHeader('X-Accel-Buffering', 'no');
       res.flushHeaders?.();
+      res.write(': connected\n\n');
 
-      const ai = getGeminiClient(customApiKey);
       const streamCandidateModels = getOrderedModels([
-        'gemini-3.1-flash-lite',
         'gemini-4-hydrogen',
+        'gemini-3.1-flash-lite',
       ]);
 
       let streamSucceeded = false;
       let lastStreamErr: any = null;
+      let clientClosed = false;
+      res.on('close', () => {
+        if (!res.writableEnded) {
+          clientClosed = true;
+        }
+      });
 
-      for (const model of streamCandidateModels) {
-        let sentAnyChunk = false;
-        try {
-          const config: any = { systemInstruction };
-          if (model === 'gemini-4-hydrogen') {
-            config.thinkingConfig = { thinkingLevel: ThinkingLevel.MINIMAL };
-          }
-
-          const responseStream = await ai.models.generateContentStream({
-            model,
-            contents: formattedContents,
-            config,
-          });
-
-          for await (const chunk of responseStream) {
-            const text = chunk.text;
-            if (text) {
-              sentAnyChunk = true;
-              res.write(`data: ${JSON.stringify({ chunk: text })}\n\n`);
-            }
-          }
-          res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
-          streamSucceeded = true;
-          return res.end();
-        } catch (e: any) {
-          lastStreamErr = e;
-          const msg = e?.message || String(e);
-          const isAuthError =
-            msg.includes('PERMISSION_DENIED') ||
-            msg.includes('ACCESS_TOKEN_SCOPE_INSUFFICIENT') ||
-            msg.includes('API_KEY_INVALID') ||
-            msg.includes('API key should be set') ||
-            msg.includes('API key not valid');
-
-          if (isAuthError) {
-            res.write(
-              `data: ${JSON.stringify({
-                error: 'Khóa Gemini API chưa hợp lệ hoặc chưa được cấu hình. Vui lòng kiểm tra Settings API Key.',
-              })}\n\n`
+      for (const ai of clients) {
+        let sawAuthErrorForClient = false;
+        for (const model of streamCandidateModels) {
+          if (clientClosed) return res.end();
+          let sentAnyChunk = false;
+          const firstChunkAbort = new AbortController();
+          const firstChunkTimer = setTimeout(() => {
+            if (!sentAnyChunk) firstChunkAbort.abort();
+          }, 14000);
+          try {
+            const config = buildModelConfig(
+              model,
+              {
+                systemInstruction,
+                abortSignal: firstChunkAbort.signal,
+              },
+              ThinkingLevel.LOW
             );
-            return res.end();
-          }
 
-          if (sentAnyChunk) {
+            const responseStream = await ai.models.generateContentStream({
+              model,
+              contents: formattedContents,
+              config,
+            });
+
+            for await (const chunk of responseStream) {
+              if (clientClosed) {
+                clearTimeout(firstChunkTimer);
+                return res.end();
+              }
+              const text = chunk.text;
+              if (text) {
+                clearTimeout(firstChunkTimer);
+                sentAnyChunk = true;
+                res.write(`data: ${JSON.stringify({ chunk: text })}\n\n`);
+              }
+            }
+            clearTimeout(firstChunkTimer);
+            if (!sentAnyChunk) {
+              throw new Error('Empty stream response');
+            }
             res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+            streamSucceeded = true;
             return res.end();
-          }
+          } catch (e: any) {
+            clearTimeout(firstChunkTimer);
+            lastStreamErr = e;
+            const msg = e?.message || String(e);
+            console.error(`[Gemini /api/gemini/chat stream] model=${model}:`, msg.slice(0, 220));
 
-          recordModelCooldown(model, e);
-          continue;
+            if (isGeminiAuthError(msg)) {
+              sawAuthErrorForClient = true;
+              break;
+            }
+
+            if (sentAnyChunk) {
+              res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+              return res.end();
+            }
+
+            recordModelCooldown(model, e);
+            continue;
+          }
+        }
+        if (!sawAuthErrorForClient) {
+          break;
         }
       }
 
-      if (!streamSucceeded) {
-        const errMsg = lastStreamErr?.message || '';
-        const friendly =
-          errMsg.includes('429') || errMsg.includes('RESOURCE_EXHAUSTED')
-            ? 'Hệ thống AI đang tạm thời đạt giới hạn lưu lượng (429). Vui lòng thử lại sau ít phút.'
-            : 'Không thể kết nối đến Trợ lý AI lúc này. Vui lòng thử lại sau giây lát.';
+      // Non-streaming fallback if SSE stream failed for non-auth reason (e.g. proxy or thinkingConfig quirk)
+      const lastMsg = lastStreamErr?.message || String(lastStreamErr || '');
+      if (!streamSucceeded && !clientClosed && !isGeminiAuthError(lastMsg)) {
+        for (const ai of clients) {
+          let sawAuthErrorForClient = false;
+          for (const model of streamCandidateModels) {
+            if (clientClosed) return res.end();
+            try {
+              const fallbackRes = await ai.models.generateContent({
+                model,
+                contents: formattedContents,
+                config: { systemInstruction },
+              });
+              const fallbackText = fallbackRes?.text?.trim();
+              if (fallbackText) {
+                res.write(`data: ${JSON.stringify({ chunk: fallbackText })}\n\n`);
+                res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+                return res.end();
+              }
+            } catch (fallbackErr: any) {
+              lastStreamErr = fallbackErr;
+              const fMsg = fallbackErr?.message || String(fallbackErr);
+              console.error(`[Gemini /api/gemini/chat fallback] model=${model}:`, fMsg.slice(0, 220));
+              if (isGeminiAuthError(fMsg)) {
+                sawAuthErrorForClient = true;
+                break;
+              }
+            }
+          }
+          if (!sawAuthErrorForClient) break;
+        }
+      }
+
+      if (!streamSucceeded && !clientClosed) {
+        const friendly = formatFriendlyGeminiError(
+          lastStreamErr,
+          'Không thể kết nối đến Trợ lý AI lúc này. Vui lòng thử lại sau giây lát.'
+        );
         res.write(`data: ${JSON.stringify({ error: friendly })}\n\n`);
         return res.end();
       }
-      return;
+      return res.end();
     }
 
     const reply = await callGeminiWithFallback({
-      preferredModel: 'gemini-3.1-flash-lite',
-      thinkingLevel: ThinkingLevel.MINIMAL,
+      preferredModel: 'gemini-4-hydrogen',
+      thinkingLevel: ThinkingLevel.LOW,
       contents: formattedContents,
       customApiKey,
       config: {
@@ -872,9 +1093,14 @@ ${currentCode ? `\n\n[MÃ NGUỒN HIỆN TẠI TRONG EDITOR]:\n\`\`\`python\n${c
     });
   } catch (error: any) {
     console.error('Error in Gemini chat:', error);
-    return res.status(500).json({
-      error: error?.message || 'Không thể kết nối với Trợ lý AI. Vui lòng thử lại.',
-    });
+    const errMsg = error?.message || 'Không thể kết nối với Trợ lý AI. Vui lòng thử lại.';
+    if (res.headersSent) {
+      try {
+        res.write(`data: ${JSON.stringify({ error: errMsg })}\n\n`);
+      } catch {}
+      return res.end();
+    }
+    return res.status(500).json({ error: errMsg });
   }
 });
 
@@ -1164,10 +1390,12 @@ finally:
       },
     });
 
-    req.on('close', () => {
-      clientDisconnected = true;
-      if (!pyProcess.killed) {
-        pyProcess.kill('SIGTERM');
+    res.on('close', () => {
+      if (!res.writableEnded) {
+        clientDisconnected = true;
+        if (!pyProcess.killed) {
+          pyProcess.kill('SIGTERM');
+        }
       }
     });
 

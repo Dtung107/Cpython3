@@ -20,7 +20,7 @@ import {
   Key,
 } from 'lucide-react';
 import { AIDebugResult } from '../types';
-import { requestAIChat, requestAIChatStream, ChatMessage } from '../services/geminiService';
+import { prewarmAIServer, requestAIChatStream, ChatMessage } from '../services/geminiService';
 
 interface AIAssistantModalProps {
   isOpen: boolean;
@@ -77,27 +77,43 @@ export const AIAssistantModal: React.FC<AIAssistantModalProps> = ({
   ]);
   const [chatInput, setChatInput] = useState('');
   const [isLoadingChat, setIsLoadingChat] = useState(false);
+  const [chatStatusText, setChatStatusText] = useState('');
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [appliedDebug, setAppliedDebug] = useState(false);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const chatInputRef = useRef<HTMLInputElement>(null);
+  const chatAbortRef = useRef<AbortController | null>(null);
 
-  // Sync initial tab when opening
+  // Sync initial tab & pre-warm AI backend when opening; abort in-flight chat on close/unmount
   useEffect(() => {
     if (isOpen) {
       setActiveTab(initialTab);
+      void prewarmAIServer();
       if (initialTab === 'chat') {
-        setTimeout(() => chatInputRef.current?.focus(), 150);
+        const timer = setTimeout(() => chatInputRef.current?.focus(), 150);
+        return () => clearTimeout(timer);
       }
+    } else {
+      chatAbortRef.current?.abort();
+      chatAbortRef.current = null;
+      setIsLoadingChat(false);
+      setChatStatusText('');
     }
   }, [isOpen, initialTab]);
 
   useEffect(() => {
+    return () => {
+      chatAbortRef.current?.abort();
+      chatAbortRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
     if (isOpen && activeTab === 'chat') {
-      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+      messagesEndRef.current?.scrollIntoView({ behavior: isLoadingChat ? 'auto' : 'smooth' });
     }
-  }, [messages, isOpen, activeTab]);
+  }, [messages, isOpen, activeTab, isLoadingChat]);
 
   if (!isOpen) return null;
 
@@ -116,15 +132,21 @@ export const AIAssistantModal: React.FC<AIAssistantModalProps> = ({
     setMessages(newMessages);
     setChatInput('');
     setIsLoadingChat(true);
+    setChatStatusText('Trợ lý AI đang kết nối...');
+
+    chatAbortRef.current?.abort();
+    const controller = new AbortController();
+    chatAbortRef.current = controller;
 
     const assistantId = (Date.now() + 1).toString();
     let accumulatedText = '';
 
     try {
       const recentMessages = newMessages
+        .filter((m) => !(m.role === 'assistant' && m.content.startsWith('⚠️ ')))
         .slice(-12)
         .map((m) => ({ role: m.role, content: m.content }));
-      const trimmedCode = currentCode.length > 6000 ? currentCode.slice(0, 6000) : currentCode;
+      const trimmedCode = currentCode.length > 4000 ? currentCode.slice(0, 4000) : currentCode;
 
       await requestAIChatStream(
         recentMessages,
@@ -147,20 +169,41 @@ export const AIAssistantModal: React.FC<AIAssistantModalProps> = ({
             }
           });
         },
-        trimmedCode
+        trimmedCode,
+        {
+          signal: controller.signal,
+          onStatus: (status) => {
+            if (!controller.signal.aborted) {
+              setChatStatusText(status);
+            }
+          },
+        }
       );
     } catch (err: any) {
+      if (controller.signal.aborted || err?.name === 'AbortError') {
+        return;
+      }
+
       let friendlyError = 'Không thể kết nối đến Trợ lý AI lúc này. Vui lòng thử lại sau giây lát.';
       const raw = err?.message || '';
-      if (raw.includes('503') || raw.includes('high demand') || raw.includes('UNAVAILABLE')) {
+      if (raw.includes('503') || raw.includes('high demand') || raw.includes('UNAVAILABLE') || raw.includes('quá tải')) {
         friendlyError = 'Hệ thống AI đang xử lý lượng yêu cầu cao. Bạn vui lòng nhấn gửi lại sau vài giây nhé!';
       } else if (raw.includes('429') || raw.includes('RESOURCE_EXHAUSTED')) {
         friendlyError = 'Hệ thống AI đang tạm thời đạt giới hạn lưu lượng miễn phí. Vui lòng thử lại sau 1-2 phút nhé!';
+      } else if (raw.includes('Model AI') || raw.includes('(400)') || raw.includes('(504)') || raw.includes('quá thời gian chờ')) {
+        friendlyError = raw;
       } else if (raw.includes('HTML response') || raw.includes('404')) {
         friendlyError = 'Bản APK chưa kết nối được tới máy chủ Cloud Backend. Hãy mở Menu > Máy Chủ AI & Backend Cloud > Cấu hình để nhập URL máy chủ đã triển khai.';
-      } else if (raw.includes('Failed to fetch') || raw.includes('NetworkError') || raw.includes('Backend')) {
-        friendlyError = raw;
-      } else if (raw.includes('API Key') || raw.includes('Khóa')) {
+      } else if (
+        raw.includes('Hết thời gian') ||
+        raw.includes('Failed to fetch') ||
+        raw.includes('NetworkError') ||
+        raw.includes('Backend') ||
+        raw.includes('API Key') ||
+        raw.includes('Khóa') ||
+        raw.includes('không trả về nội dung') ||
+        raw.includes('Lỗi kết nối')
+      ) {
         friendlyError = raw;
       }
 
@@ -172,7 +215,11 @@ export const AIAssistantModal: React.FC<AIAssistantModalProps> = ({
       };
       setMessages((prev) => [...prev, errorMsg]);
     } finally {
-      setIsLoadingChat(false);
+      if (chatAbortRef.current === controller) {
+        chatAbortRef.current = null;
+        setIsLoadingChat(false);
+        setChatStatusText('');
+      }
     }
   };
 
@@ -243,6 +290,10 @@ export const AIAssistantModal: React.FC<AIAssistantModalProps> = ({
             <button
               onClick={() => {
                 if (activeTab === 'chat') {
+                  chatAbortRef.current?.abort();
+                  chatAbortRef.current = null;
+                  setIsLoadingChat(false);
+                  setChatStatusText('');
                   setMessages([
                     {
                       id: 'welcome',
@@ -407,8 +458,8 @@ export const AIAssistantModal: React.FC<AIAssistantModalProps> = ({
 
               {isLoadingChat && messages[messages.length - 1]?.role !== 'assistant' && (
                 <div className="flex items-center space-x-2 text-slate-400 text-xs py-2 pl-9">
-                  <div className="w-4 h-4 rounded-full border-2 border-sky-400/30 border-t-sky-400 animate-spin" />
-                  <span>Trợ lý AI đang suy nghĩ câu trả lời...</span>
+                  <div className="w-4 h-4 rounded-full border-2 border-sky-400/30 border-t-sky-400 animate-spin shrink-0" />
+                  <span>{chatStatusText || 'Trợ lý AI đang suy nghĩ câu trả lời...'}</span>
                 </div>
               )}
 
