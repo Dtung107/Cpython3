@@ -43,8 +43,15 @@ import {
   prewarmCodeDependencies,
   precachePyodideCoreAssets,
   subscribePyodideWarmState,
+  trimPyodideMemory,
+  prunePyodideTransientCache,
   PyodideWarmState,
 } from './services/pyodideService';
+import {
+  initBootRecoveryGuard,
+  clearTransientCachesPreservingUserCode,
+  BootRecoveryState,
+} from './utils/apkRecovery';
 import {
   runCPythonCode,
   prewarmCPythonServer,
@@ -127,13 +134,29 @@ export default function App() {
 }
 
 function MainIDEApp() {
-  // File state
+  const [bootRecovery] = useState<BootRecoveryState>(() => initBootRecoveryGuard());
+  const [safeModeBanner, setSafeModeBanner] = useState<string | null>(() => bootRecovery.reason);
+
+  // File state with schema validation so corrupted localStorage never crash-loops on boot
   const [files, setFiles] = useState<CodeFile[]>(() => {
     const saved = localStorage.getItem('pydroid_files');
     if (saved) {
       try {
-        return JSON.parse(saved);
-      } catch (e) {}
+        const parsed = JSON.parse(saved);
+        if (
+          Array.isArray(parsed) &&
+          parsed.length > 0 &&
+          parsed.every(
+            (f) =>
+              f &&
+              typeof f.id === 'string' &&
+              typeof f.name === 'string' &&
+              typeof f.content === 'string'
+          )
+        ) {
+          return parsed;
+        }
+      } catch {}
     }
     return [{ id: '1', name: 'main.py', content: DEFAULT_MAIN_PY }];
   });
@@ -324,9 +347,45 @@ function MainIDEApp() {
     } catch {}
   };
 
+  const filesRef = useRef<CodeFile[]>(files);
+  filesRef.current = files;
+  const filesSaveTimerRef = useRef<number | null>(null);
+
   useEffect(() => {
-    safeSetStorage('pydroid_files', JSON.stringify(files));
+    if (filesSaveTimerRef.current !== null) {
+      window.clearTimeout(filesSaveTimerRef.current);
+    }
+    filesSaveTimerRef.current = window.setTimeout(() => {
+      filesSaveTimerRef.current = null;
+      safeSetStorage('pydroid_files', JSON.stringify(filesRef.current));
+    }, 450);
+
+    return () => {
+      if (filesSaveTimerRef.current !== null) {
+        window.clearTimeout(filesSaveTimerRef.current);
+        filesSaveTimerRef.current = null;
+      }
+    };
   }, [files]);
+
+  useEffect(() => {
+    const flushFilesOnHide = () => {
+      if (filesSaveTimerRef.current !== null) {
+        window.clearTimeout(filesSaveTimerRef.current);
+        filesSaveTimerRef.current = null;
+      }
+      safeSetStorage('pydroid_files', JSON.stringify(filesRef.current));
+    };
+    const onVisibilityFlush = () => {
+      if (document.hidden) flushFilesOnHide();
+    };
+    window.addEventListener('pagehide', flushFilesOnHide);
+    document.addEventListener('visibilitychange', onVisibilityFlush);
+    return () => {
+      window.removeEventListener('pagehide', flushFilesOnHide);
+      document.removeEventListener('visibilitychange', onVisibilityFlush);
+    };
+  }, []);
 
   useEffect(() => {
     safeSetStorage('pydroid_engine', engine);
@@ -373,7 +432,15 @@ function MainIDEApp() {
         })
         .catch(() => {});
     }
-  }, []);
+
+    // Boot cache hygiene: clear transient cache if rapid crash-loop recovery asked for it,
+    // otherwise lazily prune IndexedDB CDN cache down to mobile budget after startup settles.
+    const cachePruneTimer = window.setTimeout(() => {
+      void prunePyodideTransientCache(bootRecovery.clearTransientCache);
+    }, bootRecovery.clearTransientCache ? 150 : 4000);
+
+    return () => window.clearTimeout(cachePruneTimer);
+  }, [bootRecovery.clearTransientCache]);
 
   // Subscribe to warm-up status for both engines
   useEffect(() => {
@@ -388,11 +455,69 @@ function MainIDEApp() {
   const secondaryWarmTimerRef = useRef<number | null>(null);
   const activeFileContentRef = useRef<string>(activeFile?.content || DEFAULT_MAIN_PY);
   activeFileContentRef.current = activeFile?.content || DEFAULT_MAIN_PY;
+  const isRunningRef = useRef<boolean>(isRunning);
+  isRunningRef.current = isRunning;
 
   useEffect(() => {
     return () => {
       if (secondaryWarmTimerRef.current !== null) {
         window.clearTimeout(secondaryWarmTimerRef.current);
+      }
+    };
+  }, []);
+
+  // Native Android memory pressure & background trim handler (prevents prolonged-use OOM restarts)
+  useEffect(() => {
+    const handleMemoryTrim = (level: number) => {
+      const severe = level >= 15; // TRIM_MEMORY_RUNNING_CRITICAL / COMPLETE / MODERATE
+      if (!isRunningRef.current) {
+        void trimPyodideMemory({
+          recycleIdleWorker: severe || level >= 10,
+          forceRecycle: level >= 40,
+        });
+      }
+      if (severe) {
+        preservedOutputPrefixRef.current = {
+          stdout: preservedOutputPrefixRef.current.stdout.slice(-40000),
+          stderr: preservedOutputPrefixRef.current.stderr.slice(-12000),
+          plotImages: preservedOutputPrefixRef.current.plotImages.slice(-2),
+        };
+        setExecutionResult((prev) => {
+          if (!prev) return prev;
+          return {
+            ...prev,
+            stdout: (prev.stdout || '').slice(-60000),
+            stderr: (prev.stderr || '').slice(-15000),
+            plotImages: (prev.plotImages || []).slice(-2),
+          };
+        });
+      }
+    };
+
+    (window as any).__pydroidOnMemoryPressure = handleMemoryTrim;
+
+    let backgroundTrimTimer: number | null = null;
+    const onVisibilityChange = () => {
+      if (document.hidden) {
+        if (backgroundTrimTimer !== null) window.clearTimeout(backgroundTrimTimer);
+        backgroundTrimTimer = window.setTimeout(() => {
+          backgroundTrimTimer = null;
+          if (document.hidden && !isRunningRef.current && isMobileOrApk()) {
+            void trimPyodideMemory({ recycleIdleWorker: true });
+          }
+        }, 12000);
+      } else if (backgroundTrimTimer !== null) {
+        window.clearTimeout(backgroundTrimTimer);
+        backgroundTrimTimer = null;
+      }
+    };
+
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => {
+      if (backgroundTrimTimer !== null) window.clearTimeout(backgroundTrimTimer);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      if ((window as any).__pydroidOnMemoryPressure === handleMemoryTrim) {
+        delete (window as any).__pydroidOnMemoryPressure;
       }
     };
   }, []);
@@ -427,6 +552,11 @@ function MainIDEApp() {
         settledEngine === 'pyodide' || (isApk && !customServer);
       const seedCode = activeFileContentRef.current || DEFAULT_MAIN_PY;
 
+      // In Safe Mode after rapid crash recovery, avoid automatically booting WASM on startup
+      if (bootRecovery.safeMode && !isUserSwitch) {
+        return;
+      }
+
       if (useOfflinePyodide) {
         prewarmPyodide(seedCode);
         if (isUserSwitch && settledEngine === 'cpython' && isApk && !customServer) {
@@ -453,7 +583,7 @@ function MainIDEApp() {
       // Lazily pre-cache/warm the secondary engine during idle time so future switches stay fast
       secondaryWarmTimerRef.current = window.setTimeout(() => {
         secondaryWarmTimerRef.current = null;
-        if (isStale()) return;
+        if (isStale() || bootRecovery.safeMode) return;
         if (useOfflinePyodide) {
           if (!isApk || customServer) {
             void prewarmCPythonServer();
@@ -970,6 +1100,13 @@ function MainIDEApp() {
 
     const defaultEngineName = engine === 'cpython' ? 'CPython 3.10 (Native Linux)' : 'Pyodide WASM (Offline)';
 
+    const MAX_RETAINED_STDOUT_CHARS = 180000;
+    const MAX_RETAINED_STDERR_CHARS = 45000;
+    const MAX_RETAINED_PLOTS = 6;
+
+    const capTail = (text: string, maxChars: number): string =>
+      text.length > maxChars ? text.slice(text.length - maxChars) : text;
+
     if (isFresh) {
       if (autoClearTerminalOnRun) {
         preservedOutputPrefixRef.current = { stdout: '', stderr: '', plotImages: [] };
@@ -994,35 +1131,42 @@ function MainIDEApp() {
             ? `${prevStdout.endsWith('\n') ? '' : '\n'}────────────────────────\n`
             : '';
         preservedOutputPrefixRef.current = {
-          stdout: prevStdout + sep,
-          stderr: prevStderr,
-          plotImages: prevPlots,
+          stdout: capTail(prevStdout + sep, Math.floor(MAX_RETAINED_STDOUT_CHARS * 0.65)),
+          stderr: capTail(prevStderr, Math.floor(MAX_RETAINED_STDERR_CHARS * 0.5)),
+          plotImages: prevPlots.slice(-4),
         };
       }
     }
 
     const prefix = preservedOutputPrefixRef.current;
     const currentStdoutChunks: string[] = [];
+    let currentStdoutChars = 0;
     const currentStderrChunks: string[] = [];
-    let currentStdoutCache = '';
-    let currentStderrCache = '';
+    let currentStderrChars = 0;
     let flushScheduled = false;
     let flushRafId: number | null = null;
 
-    const getCurrentStdout = () => {
-      if (currentStdoutChunks.length > 0) {
-        currentStdoutCache += currentStdoutChunks.join('');
-        currentStdoutChunks.length = 0;
+    const appendBoundedChunk = (
+      chunks: string[],
+      chunk: string,
+      totalChars: number,
+      maxChars: number
+    ): number => {
+      chunks.push(chunk);
+      let next = totalChars + chunk.length;
+      while (next > maxChars && chunks.length > 1) {
+        const dropped = chunks.shift()!;
+        next -= dropped.length;
       }
-      return currentStdoutCache;
+      return next;
+    };
+
+    const getCurrentStdout = () => {
+      return capTail(currentStdoutChunks.join(''), MAX_RETAINED_STDOUT_CHARS);
     };
 
     const getCurrentStderr = () => {
-      if (currentStderrChunks.length > 0) {
-        currentStderrCache += currentStderrChunks.join('');
-        currentStderrChunks.length = 0;
-      }
-      return currentStderrCache;
+      return capTail(currentStderrChunks.join(''), MAX_RETAINED_STDERR_CHARS);
     };
 
     const mergeRunResult = (nextRes: ExecutionResult): ExecutionResult => {
@@ -1032,11 +1176,15 @@ function MainIDEApp() {
         prefix.stderr && cleanNextStderr
           ? `${prefix.stderr}\n---\n${cleanNextStderr}`
           : cleanNextStderr || prefix.stderr;
+      const combinedPlots = [...prefix.plotImages, ...(nextRes.plotImages || [])];
       return {
         ...nextRes,
-        stdout: prefix.stdout + (nextRes.stdout || ''),
-        stderr: mergedStderr,
-        plotImages: [...prefix.plotImages, ...(nextRes.plotImages || [])],
+        stdout: capTail(prefix.stdout + (nextRes.stdout || ''), MAX_RETAINED_STDOUT_CHARS),
+        stderr: capTail(mergedStderr, MAX_RETAINED_STDERR_CHARS),
+        plotImages:
+          combinedPlots.length > MAX_RETAINED_PLOTS
+            ? combinedPlots.slice(-MAX_RETAINED_PLOTS)
+            : combinedPlots,
       };
     };
 
@@ -1050,8 +1198,11 @@ function MainIDEApp() {
           ? `${prefix.stderr}\n---\n${liveStderr}`
           : liveStderr || prefix.stderr;
       setExecutionResult((prev) => ({
-        stdout: prefix.stdout + liveStdout,
-        stderr: mergedStderr || (!isFresh ? prev?.stderr || '' : ''),
+        stdout: capTail(prefix.stdout + liveStdout, MAX_RETAINED_STDOUT_CHARS),
+        stderr: capTail(
+          mergedStderr || (!isFresh ? prev?.stderr || '' : ''),
+          MAX_RETAINED_STDERR_CHARS
+        ),
         exitCode: liveStderr ? 1 : 0,
         duration: prev?.duration || 0,
         engine: prev?.engine || defaultEngineName,
@@ -1069,13 +1220,23 @@ function MainIDEApp() {
     // Batched live streaming callbacks: renders smoothly at display frame rate even under heavy print() loops
     const handleLiveStdout = (chunk: string) => {
       if (!chunk) return;
-      currentStdoutChunks.push(chunk);
+      currentStdoutChars = appendBoundedChunk(
+        currentStdoutChunks,
+        chunk,
+        currentStdoutChars,
+        MAX_RETAINED_STDOUT_CHARS
+      );
       scheduleFlush();
     };
 
     const handleLiveStderr = (chunk: string) => {
       if (!chunk) return;
-      currentStderrChunks.push(chunk);
+      currentStderrChars = appendBoundedChunk(
+        currentStderrChunks,
+        chunk,
+        currentStderrChars,
+        MAX_RETAINED_STDERR_CHARS
+      );
       scheduleFlush();
     };
 
@@ -1447,6 +1608,19 @@ function MainIDEApp() {
         </div>
       )}
 
+      {safeModeBanner && (
+        <div className="px-3 py-1.5 bg-amber-950/90 border-b border-amber-500/45 text-[11px] text-amber-100 flex items-center justify-between gap-2 shrink-0">
+          <span className="leading-snug">{safeModeBanner}</span>
+          <button
+            type="button"
+            onClick={() => setSafeModeBanner(null)}
+            className="px-2 py-0.5 rounded bg-amber-500/20 hover:bg-amber-500/35 text-amber-200 font-semibold shrink-0"
+          >
+            Đóng
+          </button>
+        </div>
+      )}
+
       {/* Main Screen: Both Editor & Terminal stay mounted; CSS visibility toggling prevents WebView DOM thrashing */}
       <main className="flex-1 flex flex-col overflow-hidden relative">
         <div
@@ -1539,6 +1713,17 @@ function MainIDEApp() {
         onExportFullBackup={handleExportFullBackup}
         onImportFullBackupFile={handleImportFullBackupFile}
         onRestoreFullBackupFromFolder={handleRestoreFullBackupFromFolder}
+        onOptimizeMemory={async () => {
+          preservedOutputPrefixRef.current = { stdout: '', stderr: '', plotImages: [] };
+          setExecutionResult(null);
+          await trimPyodideMemory({ forceRecycle: !isRunningRef.current });
+          await clearTransientCachesPreservingUserCode();
+          showToast('Đã giải phóng RAM & dọn bộ nhớ đệm WASM (giữ nguyên mã Python).');
+          return {
+            ok: true,
+            message: 'Đã giải phóng RAM & dọn bộ nhớ đệm WASM thành công.',
+          };
+        }}
         shortcutsCount={shortcuts.length}
         pipPackagesCount={userSavedPackages.length}
       />

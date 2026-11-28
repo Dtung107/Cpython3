@@ -38,8 +38,12 @@ const IDB_LEGACY_FILES_STORE = 'site_packages';
 const IDB_BUNDLES_STORE = 'package_bundles';
 const IDB_ASSETS_STORE = 'cdn_assets';
 const IDB_VERSION = 2;
-const MAX_CDN_CACHE_BYTES = 180 * 1024 * 1024;
+const IS_MOBILE_WORKER =
+  typeof navigator !== 'undefined' &&
+  /android|iphone|ipad|ipod|mobile/i.test(navigator.userAgent || '');
+const MAX_CDN_CACHE_BYTES = IS_MOBILE_WORKER ? 90 * 1024 * 1024 : 180 * 1024 * 1024;
 const MAX_RAM_ASSET_BYTES = 512 * 1024; // Only keep small manifests/scripts in RAM; never duplicate large WASM/wheels in WebView heap
+const MAX_RAM_CACHE_TOTAL_BYTES = 4 * 1024 * 1024;
 
 const IMPORT_TO_PACKAGE_MAP: Record<string, string> = {
   numpy: 'numpy',
@@ -83,8 +87,10 @@ let matplotlibConfigured = false;
 let fetchInterceptorInstalled = false;
 let importScriptsPatched = false;
 let originalFetchRef: typeof fetch | null = null;
+let workerExecCount = 0;
 
 const memoryAssetCache = new Map<string, CachedCdnAsset>();
+let memoryAssetCacheBytes = 0;
 const inflightAssetFetches = new Map<string, Promise<CachedCdnAsset | null>>();
 const verifiedImportableModules = new Set<string>();
 const verifiedImportSignatureCache = new Map<string, string[]>();
@@ -164,6 +170,32 @@ function isCacheablePyodideAssetUrl(url: string): boolean {
   return false;
 }
 
+function setBoundedMemoryAsset(url: string, asset: CachedCdnAsset): void {
+  if (asset.size > MAX_RAM_ASSET_BYTES) return;
+  const existing = memoryAssetCache.get(url);
+  if (existing) {
+    memoryAssetCacheBytes = Math.max(0, memoryAssetCacheBytes - (existing.size || 0));
+    memoryAssetCache.delete(url);
+  }
+  while (
+    memoryAssetCacheBytes + asset.size > MAX_RAM_CACHE_TOTAL_BYTES &&
+    memoryAssetCache.size > 0
+  ) {
+    const oldestKey = memoryAssetCache.keys().next().value;
+    if (!oldestKey) break;
+    const oldestVal = memoryAssetCache.get(oldestKey);
+    memoryAssetCache.delete(oldestKey);
+    memoryAssetCacheBytes = Math.max(0, memoryAssetCacheBytes - (oldestVal?.size || 0));
+  }
+  memoryAssetCache.set(url, asset);
+  memoryAssetCacheBytes += asset.size;
+}
+
+function clearMemoryAssetCache(): void {
+  memoryAssetCache.clear();
+  memoryAssetCacheBytes = 0;
+}
+
 async function getCdnAssetFromIDB(url: string): Promise<CachedCdnAsset | null> {
   const memHit = memoryAssetCache.get(url);
   if (memHit) return memHit;
@@ -178,7 +210,7 @@ async function getCdnAssetFromIDB(url: string): Promise<CachedCdnAsset | null> {
     });
     if (record && record.data && record.data.byteLength > 0) {
       if (record.size <= MAX_RAM_ASSET_BYTES) {
-        memoryAssetCache.set(url, record);
+        setBoundedMemoryAsset(url, record);
       }
       return record;
     }
@@ -208,7 +240,11 @@ async function evictOldestCdnAssetsIfNeeded(db: IDBDatabase, bytesToFree: number
 
         if (!isCoreFile) {
           freed += entry.size || 0;
-          memoryAssetCache.delete(entry.url);
+          const memOld = memoryAssetCache.get(entry.url);
+          if (memOld) {
+            memoryAssetCacheBytes = Math.max(0, memoryAssetCacheBytes - (memOld.size || 0));
+            memoryAssetCache.delete(entry.url);
+          }
           cursor.delete();
         }
         cursor.continue();
@@ -219,7 +255,70 @@ async function evictOldestCdnAssetsIfNeeded(db: IDBDatabase, bytesToFree: number
   } catch {}
 }
 
+async function enforceCdnCacheBudget(db: IDBDatabase): Promise<void> {
+  try {
+    const entries: Array<{ url: string; size: number; cachedAt: number; isCore: boolean }> = [];
+    let totalBytes = 0;
+
+    await new Promise<void>((resolve) => {
+      const tx = db.transaction(IDB_ASSETS_STORE, 'readonly');
+      const store = tx.objectStore(IDB_ASSETS_STORE);
+      const cursorReq = store.openCursor();
+      cursorReq.onsuccess = () => {
+        const cursor = cursorReq.result;
+        if (!cursor) return;
+        const val = cursor.value as CachedCdnAsset;
+        const sz = val?.size || val?.data?.byteLength || 0;
+        totalBytes += sz;
+        const isCore =
+          val.url === PYODIDE_SCRIPT_URL ||
+          val.url === PYODIDE_MJS_URL ||
+          val.url === PYODIDE_ASM_JS_URL ||
+          val.url.endsWith('pyodide.asm.wasm') ||
+          val.url.endsWith('python_stdlib.zip') ||
+          val.url.endsWith('pyodide-lock.json');
+        entries.push({ url: val.url, size: sz, cachedAt: val.cachedAt || 0, isCore });
+        cursor.continue();
+      };
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+    });
+
+    if (totalBytes <= MAX_CDN_CACHE_BYTES) return;
+
+    const targetBytes = Math.floor(MAX_CDN_CACHE_BYTES * 0.85);
+    const nonCoreOldest = entries
+      .filter((e) => !e.isCore)
+      .sort((a, b) => a.cachedAt - b.cachedAt);
+
+    const toDelete: string[] = [];
+    for (const item of nonCoreOldest) {
+      if (totalBytes <= targetBytes) break;
+      toDelete.push(item.url);
+      totalBytes -= item.size;
+    }
+
+    if (toDelete.length === 0) return;
+
+    await new Promise<void>((resolve) => {
+      const tx = db.transaction(IDB_ASSETS_STORE, 'readwrite');
+      const store = tx.objectStore(IDB_ASSETS_STORE);
+      for (const url of toDelete) {
+        const memOld = memoryAssetCache.get(url);
+        if (memOld) {
+          memoryAssetCacheBytes = Math.max(0, memoryAssetCacheBytes - (memOld.size || 0));
+          memoryAssetCache.delete(url);
+        }
+        store.delete(url);
+      }
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+    });
+  } catch {}
+}
+
 let cdnIdbWriteQueue: Promise<void> = Promise.resolve();
+let cdnWritesSinceBudgetCheck = 0;
 
 function putCdnAssetToIDB(asset: CachedCdnAsset): Promise<void> {
   if (!asset.data || asset.data.byteLength === 0 || asset.data.byteLength > 45 * 1024 * 1024) {
@@ -227,7 +326,7 @@ function putCdnAssetToIDB(asset: CachedCdnAsset): Promise<void> {
   }
 
   if (asset.size <= MAX_RAM_ASSET_BYTES) {
-    memoryAssetCache.set(asset.url, asset);
+    setBoundedMemoryAsset(asset.url, asset);
   }
 
   // Serialize IDB writes so concurrent asset fetches never spike Android WebView memory
@@ -240,6 +339,11 @@ function putCdnAssetToIDB(asset: CachedCdnAsset): Promise<void> {
         tx.oncomplete = () => resolve();
         tx.onerror = () => reject(tx.error);
       });
+      cdnWritesSinceBudgetCheck++;
+      if (cdnWritesSinceBudgetCheck >= 6 || asset.size > 1024 * 1024) {
+        cdnWritesSinceBudgetCheck = 0;
+        await enforceCdnCacheBudget(db);
+      }
     } catch (err: any) {
       if (err?.name === 'QuotaExceededError') {
         try {
@@ -722,26 +826,51 @@ def _pydroid_get_io_state():
         "stderrTail": "".join(_pydroid_stderr_buffer)
     })
 
+_pydroid_run_counter = 0
+
+def _pydroid_cleanup_after_run(force_gc=False):
+    global _pydroid_run_counter
+    _pydroid_run_counter += 1
+    if 'matplotlib.pyplot' in sys.modules:
+        try:
+            import matplotlib.pyplot as plt
+            plt.close('all')
+        except Exception:
+            pass
+    if force_gc or (_pydroid_run_counter % 4 == 0) or ('numpy' in sys.modules) or ('pandas' in sys.modules):
+        try:
+            import gc
+            gc.collect()
+        except Exception:
+            pass
+
 def _pydroid_capture_plots():
     _captured_plots = []
     if 'matplotlib.pyplot' in sys.modules:
         try:
             import matplotlib.pyplot as plt
             import base64
-            for fig_num in plt.get_fignums():
+            for fig_num in list(plt.get_fignums())[:6]:
                 fig = plt.figure(fig_num)
                 buf = io.BytesIO()
                 fig.savefig(buf, format='png', bbox_inches='tight', dpi=120)
                 buf.seek(0)
                 _captured_plots.append(base64.b64encode(buf.read()).decode('utf-8'))
+                buf.close()
                 plt.close(fig)
+            plt.close('all')
         except Exception:
-            pass
+            try:
+                import matplotlib.pyplot as plt
+                plt.close('all')
+            except Exception:
+                pass
     return _captured_plots
 
 def _pydroid_run_sync(src, inputs_json, stdout_cb, stderr_cb, capture_plots):
     _pydroid_prepare_io(inputs_json, stdout_cb, stderr_cb)
-    cached = _pydroid_code_cache.get(src)
+    can_cache = len(src) <= 80000
+    cached = _pydroid_code_cache.get(src) if can_cache else None
     if cached is None:
         try:
             code_obj = compile(src, 'main.py', 'exec')
@@ -749,17 +878,19 @@ def _pydroid_run_sync(src, inputs_json, stdout_cb, stderr_cb, capture_plots):
         except SyntaxError as syn_err:
             err_msg = str(syn_err)
             if "'await' outside" in err_msg or "'async for' outside" in err_msg or "'async with' outside" in err_msg:
-                if len(_pydroid_code_cache) >= 16:
-                    _pydroid_code_cache.pop(next(iter(_pydroid_code_cache)))
-                _pydroid_code_cache[src] = ("ASYNC", None)
+                if can_cache:
+                    if len(_pydroid_code_cache) >= 12:
+                        _pydroid_code_cache.pop(next(iter(_pydroid_code_cache)))
+                    _pydroid_code_cache[src] = ("ASYNC", None)
                 return json.dumps({"status": "need_async"})
             _pydroid_flush_io()
             import traceback
             tb = "".join(traceback.format_exception_only(type(syn_err), syn_err))
             return json.dumps({"status": "error", "error": tb})
-        if len(_pydroid_code_cache) >= 16:
-            _pydroid_code_cache.pop(next(iter(_pydroid_code_cache)))
-        _pydroid_code_cache[src] = ("SYNC", code_obj)
+        if can_cache:
+            if len(_pydroid_code_cache) >= 12:
+                _pydroid_code_cache.pop(next(iter(_pydroid_code_cache)))
+            _pydroid_code_cache[src] = ("SYNC", code_obj)
     else:
         kind, code_obj = cached
         if kind == "ASYNC":
@@ -770,12 +901,14 @@ def _pydroid_run_sync(src, inputs_json, stdout_cb, stderr_cb, capture_plots):
         exec(code_obj, ns)
     except _PydroidWaitingInput as wait_exc:
         _pydroid_flush_io()
+        _pydroid_cleanup_after_run(False)
         return json.dumps({
             "status": "waiting_input",
             "prompt": wait_exc.prompt or _pydroid_last_prompt or "input():"
         })
     except EOFError:
         _pydroid_flush_io()
+        _pydroid_cleanup_after_run(False)
         return json.dumps({
             "status": "waiting_input",
             "prompt": _pydroid_last_prompt or "input():"
@@ -784,17 +917,20 @@ def _pydroid_run_sync(src, inputs_json, stdout_cb, stderr_cb, capture_plots):
         _pydroid_flush_io()
         import traceback
         tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        _pydroid_cleanup_after_run(True)
         return json.dumps({"status": "error", "error": tb})
     finally:
         ns.clear()
 
     _pydroid_flush_io()
     plots = _pydroid_capture_plots() if capture_plots else []
+    _pydroid_cleanup_after_run(bool(plots))
     return json.dumps({"status": "ok", "plots": plots})
 
 def _pydroid_finish_async(capture_plots):
     _pydroid_flush_io()
     plots = _pydroid_capture_plots() if capture_plots else []
+    _pydroid_cleanup_after_run(bool(plots))
     return json.dumps(plots)
 
 def _pydroid_transform_sleep(src):
@@ -1045,6 +1181,12 @@ async function ensurePyodideReady(
       }
 
       self.postMessage({ type: 'warmState', state: 'ready' });
+
+      // Lazily enforce IndexedDB cache quota shortly after boot so prolonged sessions never bloat storage
+      setTimeout(() => {
+        getPipDB().then((db) => enforceCdnCacheBudget(db)).catch(() => {});
+      }, 3500);
+
       return pyodide;
     } catch (err) {
       pyodideInitPromise = null;
@@ -1312,18 +1454,54 @@ finally:
     return;
   }
 
+  if (type === 'trimMemory') {
+    clearMemoryAssetCache();
+    verifiedImportableModules.clear();
+    verifiedImportSignatureCache.clear();
+    sleepTransformCache.clear();
+    if (pyodideInstance && runtimeBootstrapped) {
+      try {
+        pyodideInstance.runPython(
+          '_pydroid_code_cache.clear()\nimport gc\ngc.collect()'
+        );
+      } catch {}
+    }
+    self.postMessage({ reqId, type: 'trimMemoryResult', ok: true, execCount: workerExecCount });
+    return;
+  }
+
   if (type === 'runCode') {
+    workerExecCount++;
     const code: string = msg.code || '';
     const inputs: string[] = Array.isArray(msg.inputs) ? msg.inputs : [];
     const savedPackages: SavedPkgInfo[] = Array.isArray(msg.savedPackages) ? msg.savedPackages : [];
 
+    const MAX_WORKER_STDOUT_CHARS = 380000;
+    const MAX_WORKER_STDERR_CHARS = 80000;
     const stdoutChunks: string[] = [];
+    let stdoutCharsTotal = 0;
     const stderrChunks: string[] = [];
+    let stderrCharsTotal = 0;
     let pendingStdout: string[] = [];
     let pendingStderr: string[] = [];
     let lastPostTime = 0;
     let flushTimer: ReturnType<typeof setTimeout> | null = null;
     const startTime = performance.now();
+
+    const pushBoundedChunk = (
+      chunks: string[],
+      chunk: string,
+      currentTotal: number,
+      maxChars: number
+    ): number => {
+      chunks.push(chunk);
+      let nextTotal = currentTotal + chunk.length;
+      while (nextTotal > maxChars && chunks.length > 1) {
+        const removed = chunks.shift()!;
+        nextTotal -= removed.length;
+      }
+      return nextTotal;
+    };
 
     const flushWorkerStreams = () => {
       if (flushTimer) {
@@ -1343,7 +1521,7 @@ finally:
 
     const onStdoutChunk = (chunk: string) => {
       if (!chunk) return;
-      stdoutChunks.push(chunk);
+      stdoutCharsTotal = pushBoundedChunk(stdoutChunks, chunk, stdoutCharsTotal, MAX_WORKER_STDOUT_CHARS);
       pendingStdout.push(chunk);
       const now = performance.now();
       // Post immediately across Worker boundary at >=16ms or >=8KB so synchronous WASM loops never starve UI updates
@@ -1356,7 +1534,7 @@ finally:
 
     const onStderrChunk = (chunk: string) => {
       if (!chunk) return;
-      stderrChunks.push(chunk);
+      stderrCharsTotal = pushBoundedChunk(stderrChunks, chunk, stderrCharsTotal, MAX_WORKER_STDERR_CHARS);
       pendingStderr.push(chunk);
       flushWorkerStreams();
     };
