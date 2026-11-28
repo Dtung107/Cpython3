@@ -1169,17 +1169,8 @@ async function ensurePyodideReady(
 
       pyodideInstance = pyodide;
 
-      // Lazily restore saved prebuilt Pyodide packages during idle time
-      const savedPrebuilt = savedPackages
-        .filter((p) => p.source === 'pyodide' && PYODIDE_PREBUILT_PACKAGES.has(p.name))
-        .map((p) => p.name)
-        .filter((n) => !isPyodidePackageLoaded(pyodide, n));
-      if (savedPrebuilt.length > 0) {
-        setTimeout(() => {
-          pyodide.loadPackage(savedPrebuilt).catch(() => {});
-        }, 120);
-      }
-
+      // Do NOT eagerly load heavy prebuilt packages (numpy/pandas/scipy/matplotlib) into WASM RAM at boot;
+      // ensureCodePackagesReady loads them on-demand from IndexedDB cache as soon as code imports them.
       self.postMessage({ type: 'warmState', state: 'ready' });
 
       // Lazily enforce IndexedDB cache quota shortly after boot so prolonged sessions never bloat storage
@@ -1359,6 +1350,69 @@ async function ensureCodePackagesReady(
   }
 }
 
+function getWorkerWasmHeapBytes(): number {
+  if (!pyodideInstance) return 0;
+  try {
+    const mod = pyodideInstance._module;
+    return (
+      mod?.HEAPU8?.byteLength ||
+      mod?.HEAP8?.byteLength ||
+      mod?.wasmMemory?.buffer?.byteLength ||
+      0
+    );
+  } catch {
+    return 0;
+  }
+}
+
+function collectWorkerMemoryStats() {
+  const wasmHeapBytes = getWorkerWasmHeapBytes();
+  let loadedPackages: string[] = [];
+  let pythonModulesCount = 0;
+  let pythonCodeCacheCount = 0;
+  let matplotlibFiguresCount = 0;
+  let gcTrackedCount = 0;
+
+  if (pyodideInstance) {
+
+    try {
+      if (pyodideInstance.loadedPackages && typeof pyodideInstance.loadedPackages === 'object') {
+        loadedPackages = Object.keys(pyodideInstance.loadedPackages);
+      }
+    } catch {}
+
+    if (runtimeBootstrapped) {
+      try {
+        const statsJson: string = pyodideInstance.runPython(
+          `(lambda _sys, _gc, _json: _json.dumps({"modules": len(_sys.modules), "codeCache": len(_pydroid_code_cache), "figures": len(_sys.modules['matplotlib.pyplot'].get_fignums()) if 'matplotlib.pyplot' in _sys.modules else 0, "gcObjects": sum(_gc.get_count())}))(__import__('sys'), __import__('gc'), __import__('json'))`
+        );
+        const parsed = JSON.parse(statsJson);
+        pythonModulesCount = Number(parsed?.modules) || 0;
+        pythonCodeCacheCount = Number(parsed?.codeCache) || 0;
+        matplotlibFiguresCount = Number(parsed?.figures) || 0;
+        gcTrackedCount = Number(parsed?.gcObjects) || 0;
+      } catch {}
+    }
+  }
+
+  return {
+    initialized: !!pyodideInstance,
+    wasmHeapBytes,
+    loadedPackages,
+    pythonModulesCount,
+    pythonCodeCacheCount,
+    matplotlibFiguresCount,
+    gcTrackedCount,
+    ramAssetCacheBytes: memoryAssetCacheBytes,
+    ramAssetCacheCount: memoryAssetCache.size,
+    localJsCacheEntries:
+      verifiedImportableModules.size +
+      verifiedImportSignatureCache.size +
+      sleepTransformCache.size,
+    execCount: workerExecCount,
+  };
+}
+
 self.onmessage = async (ev: MessageEvent) => {
   const msg = ev.data || {};
   const { reqId, type } = msg;
@@ -1454,6 +1508,12 @@ finally:
     return;
   }
 
+  if (type === 'getMemoryDiagnostics') {
+    const diag = collectWorkerMemoryStats();
+    self.postMessage({ reqId, type: 'memoryDiagnosticsResult', diagnostics: diag });
+    return;
+  }
+
   if (type === 'trimMemory') {
     clearMemoryAssetCache();
     verifiedImportableModules.clear();
@@ -1462,11 +1522,18 @@ finally:
     if (pyodideInstance && runtimeBootstrapped) {
       try {
         pyodideInstance.runPython(
-          '_pydroid_code_cache.clear()\nimport gc\ngc.collect()'
+          '_pydroid_code_cache.clear()\nimport linecache\nlinecache.clearcache()\n_pydroid_cleanup_after_run(True)'
         );
       } catch {}
     }
-    self.postMessage({ reqId, type: 'trimMemoryResult', ok: true, execCount: workerExecCount });
+    const diag = collectWorkerMemoryStats();
+    self.postMessage({
+      reqId,
+      type: 'trimMemoryResult',
+      ok: true,
+      execCount: workerExecCount,
+      diagnostics: diag,
+    });
     return;
   }
 
@@ -1667,6 +1734,7 @@ except Exception:
           self.postMessage({
             reqId,
             type: 'runResult',
+            wasmHeapBytes: getWorkerWasmHeapBytes(),
             result: {
               stdout: stdoutChunks.join(''),
               stderr: stderrChunks.join(''),
@@ -1685,6 +1753,7 @@ except Exception:
           self.postMessage({
             reqId,
             type: 'runResult',
+            wasmHeapBytes: getWorkerWasmHeapBytes(),
             result: {
               stdout: stdoutChunks.join(''),
               stderr: '',
@@ -1706,6 +1775,7 @@ except Exception:
           self.postMessage({
             reqId,
             type: 'runResult',
+            wasmHeapBytes: getWorkerWasmHeapBytes(),
             result: {
               stdout: stdoutChunks.join(''),
               stderr: stderrJoined ? `${stderrJoined}\n${cleanedErr}` : cleanedErr,
@@ -1746,6 +1816,7 @@ except Exception:
       self.postMessage({
         reqId,
         type: 'runResult',
+        wasmHeapBytes: getWorkerWasmHeapBytes(),
         result: {
           stdout: stdoutChunks.join(''),
           stderr: stderrChunks.join(''),
@@ -1783,6 +1854,7 @@ except Exception:
         self.postMessage({
           reqId,
           type: 'runResult',
+          wasmHeapBytes: getWorkerWasmHeapBytes(),
           result: {
             stdout: stdoutChunks.join(''),
             stderr: '',
@@ -1807,6 +1879,7 @@ except Exception:
       self.postMessage({
         reqId,
         type: 'runResult',
+        wasmHeapBytes: getWorkerWasmHeapBytes(),
         result: {
           stdout: stdoutChunks.join(''),
           stderr: stderrJoined ? `${stderrJoined}\n${cleanErr}` : cleanErr,

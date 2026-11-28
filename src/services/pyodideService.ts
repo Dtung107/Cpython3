@@ -138,12 +138,32 @@ function extractImportSignature(code: string): string {
   return Array.from(mods).sort().join(',');
 }
 
+export function extractCodeImportSignature(code: string): string {
+  return extractImportSignature(code);
+}
+
 // --- Dedicated Web Worker Controller for 60fps Non-Blocking UI & Hard Cancel ---
 let pyodideWorker: Worker | null = null;
 let workerUnavailable = typeof Worker === 'undefined';
 let workerReqSeq = 0;
 let workerRunCount = 0;
 let workerHeavyRun = false;
+let lastWorkerRunEndedAt = 0;
+let lastKnownWasmHeapBytes = 0;
+let lastIdbBudgetCheckAt = 0;
+let lastWorkerDiagnosticsCache: {
+  initialized: boolean;
+  wasmHeapBytes: number;
+  loadedPackages: string[];
+  pythonModulesCount: number;
+  pythonCodeCacheCount: number;
+  matplotlibFiguresCount: number;
+  gcTrackedCount: number;
+  ramAssetCacheBytes: number;
+  ramAssetCacheCount: number;
+  localJsCacheEntries: number;
+  execCount: number;
+} | null = null;
 
 interface WorkerPendingRequest {
   resolve: (val: any) => void;
@@ -168,6 +188,9 @@ function terminatePyodideWorker(reason?: Error): void {
   }
   workerRunCount = 0;
   workerHeavyRun = false;
+  lastWorkerRunEndedAt = 0;
+  lastKnownWasmHeapBytes = 0;
+  lastWorkerDiagnosticsCache = null;
   for (const [, pending] of workerPendingRequests) {
     pending.reject(reason || new DOMException('Đã dừng thực thi.', 'AbortError'));
   }
@@ -1251,7 +1274,6 @@ export async function restorePipBackupData(
         legacyFiles: [],
       });
     }
-    scheduleBackgroundPrebuiltRestore(window.pyodideInstance);
   } else {
     sitePackagesRestored = false;
   }
@@ -1732,6 +1754,8 @@ export function precachePyodideCoreAssets(): void {
     for (const url of coreUrls) {
       try {
         await fetchAndCachePyodideAsset(url);
+        // Yield briefly between core assets so WebView GC reclaims ArrayBuffers without spikes
+        await new Promise((resolve) => setTimeout(resolve, 80));
       } catch {
         // Best-effort idle pre-cache
       }
@@ -1742,27 +1766,6 @@ export function precachePyodideCoreAssets(): void {
     (window as any).requestIdleCallback(() => void runPrefetch(), { timeout: 2500 });
   } else {
     setTimeout(() => void runPrefetch(), 600);
-  }
-}
-
-function scheduleBackgroundPrebuiltRestore(pyodide: any): void {
-  const savedPrebuilt = getSavedUserPipPackages()
-    .filter((entry) => entry.source === 'pyodide' && PYODIDE_PREBUILT_PACKAGES.has(entry.name))
-    .map((entry) => entry.name)
-    .filter((name) => !isPyodidePackageLoaded(pyodide, name));
-
-  if (savedPrebuilt.length === 0) return;
-
-  const runRestore = () => {
-    pyodide.loadPackage(savedPrebuilt).catch(() => {
-      // ignore if offline and a wheel wasn't cached yet
-    });
-  };
-
-  if (typeof (window as any).requestIdleCallback === 'function') {
-    (window as any).requestIdleCallback(runRestore, { timeout: 2000 });
-  } else {
-    setTimeout(runRestore, 200);
   }
 }
 
@@ -1814,9 +1817,6 @@ export async function getPyodideInstance(onProgress?: (message: string) => void)
       window.pyodideInstance = pyodide;
       coreAssetsPrecached = true;
       setPyodideWarmState('ready');
-
-      // Quietly pre-load saved Pyodide wheels (from IndexedDB cdn_assets) during idle time
-      scheduleBackgroundPrebuiltRestore(pyodide);
 
       return pyodide;
     } catch (err) {
@@ -2172,6 +2172,330 @@ finally:
   return { checked: false };
 }
 
+export interface PyodideMemorySnapshot {
+  timestamp: number;
+  warmState: PyodideWarmState;
+  runtimeMode: 'worker' | 'main-thread' | 'unloaded';
+  workerBusy: boolean;
+  execCount: number;
+  wasmHeapBytes: number;
+  pythonModulesCount: number;
+  pythonCodeCacheCount: number;
+  matplotlibFiguresCount: number;
+  gcTrackedCount: number;
+  loadedPackages: string[];
+  ramAssetCacheBytes: number;
+  ramAssetCacheCount: number;
+  localJsCacheEntries: number;
+  jsHeapUsedBytes: number | null;
+  jsHeapTotalBytes: number | null;
+  jsHeapLimitBytes: number | null;
+  idbCdnAssetsBytes: number;
+  idbCdnAssetsCount: number;
+  idbCdnBudgetBytes: number;
+  idbPackageBundlesBytes: number;
+  idbPackageBundlesCount: number;
+  storageUsageBytes: number | null;
+  storageQuotaBytes: number | null;
+  terminalBufferBytes: number;
+  terminalPlotCount: number;
+}
+
+export interface RamHistorySample {
+  timestamp: number;
+  wasmHeapMb: number;
+  jsHeapMb: number | null;
+  terminalMb: number;
+  idbCdnMb: number;
+  event?: 'cleanup-light' | 'cleanup-deep';
+}
+
+const MAX_RAM_HISTORY_SAMPLES = 28;
+const ramHistorySamples: RamHistorySample[] = [];
+let cachedIdbScan: {
+  scannedAt: number;
+  cdnAssetsBytes: number;
+  cdnAssetsCount: number;
+  packageBundlesBytes: number;
+  packageBundlesCount: number;
+} | null = null;
+
+export function getRamHistorySamples(): RamHistorySample[] {
+  return [...ramHistorySamples];
+}
+
+export function clearRamHistorySamples(): void {
+  ramHistorySamples.length = 0;
+}
+
+async function callPyodideWorkerWithTimeout<T = any>(
+  payload: Record<string, any>,
+  timeoutMs = 750
+): Promise<T | null> {
+  if (!pyodideWorker || workerUnavailable) return null;
+  try {
+    return await Promise.race([
+      callPyodideWorker<T>(payload),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), timeoutMs)),
+    ]);
+  } catch {
+    return null;
+  }
+}
+
+async function scanIdbStorageStats(forceScan = false): Promise<{
+  cdnAssetsBytes: number;
+  cdnAssetsCount: number;
+  packageBundlesBytes: number;
+  packageBundlesCount: number;
+}> {
+  if (!forceScan && cachedIdbScan && Date.now() - cachedIdbScan.scannedAt < 10000) {
+    return {
+      cdnAssetsBytes: cachedIdbScan.cdnAssetsBytes,
+      cdnAssetsCount: cachedIdbScan.cdnAssetsCount,
+      packageBundlesBytes: cachedIdbScan.packageBundlesBytes,
+      packageBundlesCount: cachedIdbScan.packageBundlesCount,
+    };
+  }
+
+  let cdnAssetsBytes = 0;
+  let cdnAssetsCount = 0;
+  let packageBundlesBytes = 0;
+  let packageBundlesCount = 0;
+
+  try {
+    const db = await getPipDB();
+    const storeNames: string[] = [];
+    if (db.objectStoreNames.contains(IDB_ASSETS_STORE)) storeNames.push(IDB_ASSETS_STORE);
+    if (db.objectStoreNames.contains(IDB_BUNDLES_STORE)) storeNames.push(IDB_BUNDLES_STORE);
+
+    if (storeNames.length > 0) {
+      await new Promise<void>((resolve) => {
+        const tx = db.transaction(storeNames, 'readonly');
+
+        if (db.objectStoreNames.contains(IDB_ASSETS_STORE)) {
+          const assetCursor = tx.objectStore(IDB_ASSETS_STORE).openCursor();
+          assetCursor.onsuccess = () => {
+            const cursor = assetCursor.result;
+            if (!cursor) return;
+            const val = cursor.value as CachedCdnAsset;
+            cdnAssetsCount++;
+            cdnAssetsBytes += val?.size || val?.data?.byteLength || 0;
+            cursor.continue();
+          };
+        }
+
+        if (db.objectStoreNames.contains(IDB_BUNDLES_STORE)) {
+          const bundleCursor = tx.objectStore(IDB_BUNDLES_STORE).openCursor();
+          bundleCursor.onsuccess = () => {
+            const cursor = bundleCursor.result;
+            if (!cursor) return;
+            const val = cursor.value as CachedPackageBundle;
+            packageBundlesCount++;
+            packageBundlesBytes += val?.totalBytes || 0;
+            cursor.continue();
+          };
+        }
+
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => resolve();
+      });
+    }
+  } catch {}
+
+  cachedIdbScan = {
+    scannedAt: Date.now(),
+    cdnAssetsBytes,
+    cdnAssetsCount,
+    packageBundlesBytes,
+    packageBundlesCount,
+  };
+
+  return {
+    cdnAssetsBytes,
+    cdnAssetsCount,
+    packageBundlesBytes,
+    packageBundlesCount,
+  };
+}
+
+function collectMainThreadPyodideStats(): {
+  initialized: boolean;
+  wasmHeapBytes: number;
+  loadedPackages: string[];
+  pythonModulesCount: number;
+  pythonCodeCacheCount: number;
+  matplotlibFiguresCount: number;
+  gcTrackedCount: number;
+  ramAssetCacheBytes: number;
+  ramAssetCacheCount: number;
+  localJsCacheEntries: number;
+  execCount: number;
+} {
+  const py = typeof window !== 'undefined' ? window.pyodideInstance : undefined;
+  let wasmHeapBytes = 0;
+  let loadedPackages: string[] = [];
+  let pythonModulesCount = 0;
+  let pythonCodeCacheCount = 0;
+  let matplotlibFiguresCount = 0;
+  let gcTrackedCount = 0;
+
+  if (py) {
+    try {
+      const mod = py._module;
+      wasmHeapBytes =
+        mod?.HEAPU8?.byteLength ||
+        mod?.HEAP8?.byteLength ||
+        mod?.wasmMemory?.buffer?.byteLength ||
+        0;
+    } catch {}
+
+    try {
+      if (py.loadedPackages && typeof py.loadedPackages === 'object') {
+        loadedPackages = Object.keys(py.loadedPackages);
+      }
+    } catch {}
+
+    if (runtimeBootstrapped) {
+      try {
+        const statsJson: string = py.runPython(
+          `(lambda _sys, _gc, _json: _json.dumps({"modules": len(_sys.modules), "codeCache": len(_pydroid_code_cache), "figures": len(_sys.modules['matplotlib.pyplot'].get_fignums()) if 'matplotlib.pyplot' in _sys.modules else 0, "gcObjects": sum(_gc.get_count())}))(__import__('sys'), __import__('gc'), __import__('json'))`
+        );
+        const parsed = JSON.parse(statsJson);
+        pythonModulesCount = Number(parsed?.modules) || 0;
+        pythonCodeCacheCount = Number(parsed?.codeCache) || 0;
+        matplotlibFiguresCount = Number(parsed?.figures) || 0;
+        gcTrackedCount = Number(parsed?.gcObjects) || 0;
+      } catch {}
+    }
+  }
+
+  return {
+    initialized: !!py,
+    wasmHeapBytes,
+    loadedPackages,
+    pythonModulesCount,
+    pythonCodeCacheCount,
+    matplotlibFiguresCount,
+    gcTrackedCount,
+    ramAssetCacheBytes: memoryAssetCacheBytes,
+    ramAssetCacheCount: memoryAssetCache.size,
+    localJsCacheEntries:
+      verifiedImportableModules.size +
+      verifiedImportSignatureCache.size +
+      sleepTransformCache.size,
+    execCount: workerRunCount,
+  };
+}
+
+export async function getPyodideMemoryDiagnostics(
+  options: {
+    terminalBufferBytes?: number;
+    terminalPlotCount?: number;
+    forceIdbScan?: boolean;
+    recordSample?: boolean;
+    event?: 'cleanup-light' | 'cleanup-deep';
+  } = {}
+): Promise<PyodideMemorySnapshot> {
+  const workerBusy = workerPendingRequests.size > 0;
+  let runtimeMode: 'worker' | 'main-thread' | 'unloaded' = 'unloaded';
+  let stats = collectMainThreadPyodideStats();
+
+  if (typeof window !== 'undefined' && window.pyodideInstance) {
+    runtimeMode = 'main-thread';
+  } else if (pyodideWorker && !workerUnavailable) {
+    if (!workerBusy) {
+      const res = await callPyodideWorkerWithTimeout<any>({ type: 'getMemoryDiagnostics' }, 750);
+      if (res?.diagnostics) {
+        lastWorkerDiagnosticsCache = res.diagnostics;
+      }
+    }
+    if (lastWorkerDiagnosticsCache?.initialized) {
+      runtimeMode = 'worker';
+      stats = {
+        ...lastWorkerDiagnosticsCache,
+        ramAssetCacheBytes: lastWorkerDiagnosticsCache.ramAssetCacheBytes + memoryAssetCacheBytes,
+        ramAssetCacheCount: lastWorkerDiagnosticsCache.ramAssetCacheCount + memoryAssetCache.size,
+      };
+    } else if (lastWorkerDiagnosticsCache) {
+      stats = {
+        ...lastWorkerDiagnosticsCache,
+        ramAssetCacheBytes: lastWorkerDiagnosticsCache.ramAssetCacheBytes + memoryAssetCacheBytes,
+        ramAssetCacheCount: lastWorkerDiagnosticsCache.ramAssetCacheCount + memoryAssetCache.size,
+      };
+    }
+  }
+
+  const perfMem =
+    typeof performance !== 'undefined' ? (performance as any).memory : undefined;
+  const jsHeapUsedBytes =
+    typeof perfMem?.usedJSHeapSize === 'number' ? perfMem.usedJSHeapSize : null;
+  const jsHeapTotalBytes =
+    typeof perfMem?.totalJSHeapSize === 'number' ? perfMem.totalJSHeapSize : null;
+  const jsHeapLimitBytes =
+    typeof perfMem?.jsHeapSizeLimit === 'number' ? perfMem.jsHeapSizeLimit : null;
+
+  let storageUsageBytes: number | null = null;
+  let storageQuotaBytes: number | null = null;
+  if (typeof navigator !== 'undefined' && navigator.storage?.estimate) {
+    try {
+      const est = await navigator.storage.estimate();
+      if (typeof est.usage === 'number') storageUsageBytes = est.usage;
+      if (typeof est.quota === 'number') storageQuotaBytes = est.quota;
+    } catch {}
+  }
+
+  const idbStats = await scanIdbStorageStats(Boolean(options.forceIdbScan));
+  const terminalBufferBytes = Math.max(0, options.terminalBufferBytes || 0);
+  const terminalPlotCount = Math.max(0, options.terminalPlotCount || 0);
+
+  const snapshot: PyodideMemorySnapshot = {
+    timestamp: Date.now(),
+    warmState: getPyodideWarmState(),
+    runtimeMode,
+    workerBusy,
+    execCount: stats.execCount || workerRunCount,
+    wasmHeapBytes: stats.wasmHeapBytes,
+    pythonModulesCount: stats.pythonModulesCount,
+    pythonCodeCacheCount: stats.pythonCodeCacheCount,
+    matplotlibFiguresCount: stats.matplotlibFiguresCount,
+    gcTrackedCount: stats.gcTrackedCount,
+    loadedPackages: stats.loadedPackages,
+    ramAssetCacheBytes: stats.ramAssetCacheBytes,
+    ramAssetCacheCount: stats.ramAssetCacheCount,
+    localJsCacheEntries: stats.localJsCacheEntries,
+    jsHeapUsedBytes,
+    jsHeapTotalBytes,
+    jsHeapLimitBytes,
+    idbCdnAssetsBytes: idbStats.cdnAssetsBytes,
+    idbCdnAssetsCount: idbStats.cdnAssetsCount,
+    idbCdnBudgetBytes: MAX_CDN_CACHE_BYTES,
+    idbPackageBundlesBytes: idbStats.packageBundlesBytes,
+    idbPackageBundlesCount: idbStats.packageBundlesCount,
+    storageUsageBytes,
+    storageQuotaBytes,
+    terminalBufferBytes,
+    terminalPlotCount,
+  };
+
+  if (options.recordSample !== false) {
+    const toMb = (b: number) => Math.round((b / (1024 * 1024)) * 100) / 100;
+    ramHistorySamples.push({
+      timestamp: snapshot.timestamp,
+      wasmHeapMb: toMb(snapshot.wasmHeapBytes),
+      jsHeapMb: snapshot.jsHeapUsedBytes !== null ? toMb(snapshot.jsHeapUsedBytes) : null,
+      terminalMb: toMb(snapshot.terminalBufferBytes),
+      idbCdnMb: toMb(snapshot.idbCdnAssetsBytes),
+      event: options.event,
+    });
+    if (ramHistorySamples.length > MAX_RAM_HISTORY_SAMPLES) {
+      ramHistorySamples.splice(0, ramHistorySamples.length - MAX_RAM_HISTORY_SAMPLES);
+    }
+  }
+
+  return snapshot;
+}
+
 export async function trimPyodideMemory(
   options: { recycleIdleWorker?: boolean; forceRecycle?: boolean } = {}
 ): Promise<{ recycled: boolean }> {
@@ -2195,14 +2519,17 @@ export async function trimPyodideMemory(
 
   if (pyodideWorker && !workerUnavailable && !workerBusy) {
     try {
-      await callPyodideWorker({ type: 'trimMemory' });
+      const res = await callPyodideWorkerWithTimeout<any>({ type: 'trimMemory' }, 1200);
+      if (res?.diagnostics) {
+        lastWorkerDiagnosticsCache = res.diagnostics;
+      }
     } catch {}
   }
 
   if (typeof window !== 'undefined' && window.pyodideInstance && runtimeBootstrapped) {
     try {
       window.pyodideInstance.runPython(
-        '_pydroid_code_cache.clear()\nimport gc\ngc.collect()'
+        '_pydroid_code_cache.clear()\n_pydroid_cleanup_after_run(True)'
       );
     } catch {}
   }
@@ -2212,6 +2539,8 @@ export async function trimPyodideMemory(
 
 export async function prunePyodideTransientCache(clearAllCdnAssets = false): Promise<void> {
   clearMemoryAssetCache();
+  cachedIdbScan = null;
+  lastIdbBudgetCheckAt = Date.now();
   try {
     const db = await getPipDB();
     if (!db.objectStoreNames.contains(IDB_ASSETS_STORE)) return;
@@ -2226,6 +2555,56 @@ export async function prunePyodideTransientCache(clearAllCdnAssets = false): Pro
       await enforceCdnCacheBudget(db);
     }
   } catch {}
+}
+
+export async function runPeriodicPyodideMaintenance(
+  options: { isPythonRunning?: boolean } = {}
+): Promise<{ action: 'none' | 'trimmed' | 'recycled' }> {
+  const now = Date.now();
+
+  if (now - lastIdbBudgetCheckAt >= 120_000) {
+    void prunePyodideTransientCache(false);
+  }
+
+  if (options.isPythonRunning || workerPendingRequests.size > 0) {
+    return { action: 'none' };
+  }
+
+  const idleMs = lastWorkerRunEndedAt > 0 ? now - lastWorkerRunEndedAt : Number.MAX_SAFE_INTEGER;
+  const wasmThresholdBytes = IS_MOBILE_RUNTIME ? 110 * 1024 * 1024 : 220 * 1024 * 1024;
+  const perfMem = typeof performance !== 'undefined' ? (performance as any).memory : undefined;
+  const jsHeapRatio =
+    typeof perfMem?.usedJSHeapSize === 'number' &&
+    typeof perfMem?.jsHeapSizeLimit === 'number' &&
+    perfMem.jsHeapSizeLimit > 0
+      ? perfMem.usedJSHeapSize / perfMem.jsHeapSizeLimit
+      : 0;
+
+  const hasLoadedWorker = !!pyodideWorker && getPyodideWarmState() === 'ready';
+  const shouldRecycle =
+    hasLoadedWorker &&
+    idleMs >= 45_000 &&
+    (lastKnownWasmHeapBytes >= wasmThresholdBytes ||
+      jsHeapRatio >= 0.72 ||
+      workerRunCount >= 10 ||
+      (workerHeavyRun && idleMs >= 60_000));
+
+  if (shouldRecycle) {
+    await trimPyodideMemory({ forceRecycle: true });
+    return { action: 'recycled' };
+  }
+
+  if (
+    idleMs >= 20_000 &&
+    (hasLoadedWorker ||
+      (typeof window !== 'undefined' && !!window.pyodideInstance && runtimeBootstrapped) ||
+      memoryAssetCacheBytes > 0)
+  ) {
+    await trimPyodideMemory({ recycleIdleWorker: false, forceRecycle: false });
+    return { action: 'trimmed' };
+  }
+
+  return { action: 'none' };
 }
 
 export async function runPyodideCode(options: PyodideRunOptions): Promise<{
@@ -2270,6 +2649,10 @@ export async function runPyodideCode(options: PyodideRunOptions): Promise<{
         workerUnavailable = true;
         terminatePyodideWorker(new Error(res.error || 'Worker boot failed'));
       } else if (res?.type === 'runResult' && res.result) {
+        lastWorkerRunEndedAt = Date.now();
+        if (typeof res.wasmHeapBytes === 'number' && res.wasmHeapBytes > 0) {
+          lastKnownWasmHeapBytes = res.wasmHeapBytes;
+        }
         if ((res.result.stdout?.length || 0) > 120000 || (res.result.plotImages?.length || 0) > 0) {
           workerHeavyRun = true;
         }

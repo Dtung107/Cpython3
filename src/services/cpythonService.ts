@@ -52,10 +52,31 @@ export function subscribeCPythonWarmState(
   return () => warmListeners.delete(listener);
 }
 
+const MAX_CPYTHON_STDOUT_CHARS = 240_000;
+const MAX_CPYTHON_STDERR_CHARS = 60_000;
+const MAX_CPYTHON_PLOTS = 6;
+
+function appendBoundedOutput(current: string, chunk: string, maxChars: number): string {
+  if (!chunk) return current;
+  const combined = current + chunk;
+  if (combined.length <= maxChars) return combined;
+  return combined.slice(combined.length - maxChars);
+}
+
 export function resetCPythonWarmState(): void {
   lastServerWarmAt = 0;
   inflightWarmPromise = null;
   setCPythonWarmState('idle', '');
+}
+
+export function trimCPythonMemory(): void {
+  const now = Date.now();
+  if (cpythonWarmState !== 'warming' && now - lastServerWarmAt > 45_000) {
+    lastServerWarmAt = 0;
+    if (cpythonWarmState === 'offline') {
+      setCPythonWarmState('idle', '');
+    }
+  }
 }
 
 // Silently wake/warm the CPython interpreter & backend server so subsequent RUN / engine switches have minimal latency
@@ -233,18 +254,38 @@ export async function runCPythonCode(options: CPythonRunOptions): Promise<CPytho
             }
 
             if (evt.type === 'stdout' && evt.chunk) {
-              finalResult.stdout += evt.chunk;
+              finalResult.stdout = appendBoundedOutput(
+                finalResult.stdout,
+                evt.chunk,
+                MAX_CPYTHON_STDOUT_CHARS
+              );
               onStdout?.(evt.chunk);
             } else if (evt.type === 'stderr' && evt.chunk) {
-              finalResult.stderr += evt.chunk;
+              finalResult.stderr = appendBoundedOutput(
+                finalResult.stderr,
+                evt.chunk,
+                MAX_CPYTHON_STDERR_CHARS
+              );
               onStderr?.(evt.chunk);
             } else if (evt.type === 'done') {
-              finalResult.stdout = evt.stdout !== undefined ? evt.stdout : finalResult.stdout;
-              finalResult.stderr = evt.stderr !== undefined ? evt.stderr : finalResult.stderr;
+              const rawDoneStdout =
+                evt.stdout !== undefined ? String(evt.stdout) : finalResult.stdout;
+              const rawDoneStderr =
+                evt.stderr !== undefined ? String(evt.stderr) : finalResult.stderr;
+              finalResult.stdout =
+                rawDoneStdout.length > MAX_CPYTHON_STDOUT_CHARS
+                  ? rawDoneStdout.slice(rawDoneStdout.length - MAX_CPYTHON_STDOUT_CHARS)
+                  : rawDoneStdout;
+              finalResult.stderr =
+                rawDoneStderr.length > MAX_CPYTHON_STDERR_CHARS
+                  ? rawDoneStderr.slice(rawDoneStderr.length - MAX_CPYTHON_STDERR_CHARS)
+                  : rawDoneStderr;
               finalResult.exitCode = evt.exitCode ?? 0;
               finalResult.duration = evt.duration || 0;
               finalResult.engine = evt.engine || 'CPython 3.10 (Native Linux)';
-              finalResult.plotImages = Array.isArray(evt.plotImages) ? evt.plotImages : [];
+              finalResult.plotImages = Array.isArray(evt.plotImages)
+                ? evt.plotImages.slice(0, MAX_CPYTHON_PLOTS)
+                : [];
               finalResult.isWaitingInput = !!evt.isWaitingInput;
               finalResult.prompt = evt.prompt || '';
             } else if (evt.type === 'error') {
@@ -262,20 +303,30 @@ export async function runCPythonCode(options: CPythonRunOptions): Promise<CPytho
 
   // Fallback normal JSON response
   const data = await response.json();
-  if (onStdout && data.stdout) {
-    onStdout(data.stdout);
+  const rawStdout = String(data.stdout || '');
+  const rawStderr = String(data.stderr || '');
+  if (onStdout && rawStdout) {
+    onStdout(rawStdout);
   }
-  if (onStderr && data.stderr) {
-    onStderr(data.stderr);
+  if (onStderr && rawStderr) {
+    onStderr(rawStderr);
   }
 
   return {
-    stdout: data.stdout || '',
-    stderr: data.stderr || '',
+    stdout:
+      rawStdout.length > MAX_CPYTHON_STDOUT_CHARS
+        ? rawStdout.slice(rawStdout.length - MAX_CPYTHON_STDOUT_CHARS)
+        : rawStdout,
+    stderr:
+      rawStderr.length > MAX_CPYTHON_STDERR_CHARS
+        ? rawStderr.slice(rawStderr.length - MAX_CPYTHON_STDERR_CHARS)
+        : rawStderr,
     exitCode: data.exitCode ?? (data.success ? 0 : 1),
     duration: data.duration || 0,
     engine: data.engine || 'CPython 3.10 (Native Linux)',
-    plotImages: Array.isArray(data.plotImages) ? data.plotImages : [],
+    plotImages: Array.isArray(data.plotImages)
+      ? data.plotImages.slice(0, MAX_CPYTHON_PLOTS)
+      : [],
     isWaitingInput: !!data.isWaitingInput,
     prompt: data.prompt || '',
   };

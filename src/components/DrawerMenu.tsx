@@ -24,6 +24,8 @@ import {
   Archive,
   Upload,
   FolderOpen,
+  Activity,
+  Eraser,
 } from 'lucide-react';
 import { User } from 'firebase/auth';
 import { EngineType } from '../types';
@@ -65,6 +67,9 @@ interface DrawerMenuProps {
   onImportFullBackupFile?: (file: File) => Promise<{ ok: boolean; message: string }>;
   onRestoreFullBackupFromFolder?: () => Promise<{ ok: boolean; message: string }>;
   onOptimizeMemory?: () => Promise<{ ok: boolean; message: string }>;
+  onOpenRamDiagnostics?: () => void;
+  onQuickClearTerminal?: () => Promise<void> | void;
+  hasTerminalData?: boolean;
   shortcutsCount?: number;
   pipPackagesCount?: number;
 }
@@ -91,6 +96,9 @@ export const DrawerMenu: React.FC<DrawerMenuProps> = ({
   onImportFullBackupFile,
   onRestoreFullBackupFromFolder,
   onOptimizeMemory,
+  onOpenRamDiagnostics,
+  onQuickClearTerminal,
+  hasTerminalData = false,
   shortcutsCount = 0,
   pipPackagesCount = 0,
 }) => {
@@ -318,6 +326,35 @@ export const DrawerMenu: React.FC<DrawerMenuProps> = ({
 
           {/* Drawer Body — Ordered strictly per user layout */}
           <div className="p-3 space-y-3 flex-1">
+            {/* Quick Clear Terminal Action */}
+            {onQuickClearTerminal && (
+              <button
+                type="button"
+                onClick={() => {
+                  void onQuickClearTerminal();
+                  onClose();
+                }}
+                className="w-full min-h-[48px] text-left px-3 py-2.5 rounded-2xl bg-gradient-to-r from-[#24131c] via-[#131424] to-[#080d18] border border-rose-500/40 hover:border-rose-400/70 shadow-[0_4px_16px_rgba(244,63,94,0.12)] flex items-center justify-between gap-2.5 active:scale-[0.99] transition"
+              >
+                <div className="flex items-center space-x-3 min-w-0">
+                  <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-rose-500/25 to-orange-500/15 border border-rose-400/50 flex items-center justify-center shrink-0">
+                    <Eraser className="w-5 h-5 text-rose-300" />
+                  </div>
+                  <div className="min-w-0">
+                    <div className="text-[13px] font-bold text-slate-50 truncate">
+                      Xoá nhanh terminal
+                    </div>
+                    <div className="text-[11px] text-slate-300/80 truncate">
+                      {hasTerminalData
+                        ? 'Dọn output, đồ thị & dữ liệu tạm phiên trước'
+                        : 'Dọn sạch dữ liệu tạm không cần chạy lại mã'}
+                    </div>
+                  </div>
+                </div>
+                <ChevronRight className="w-4.5 h-4.5 text-rose-300 shrink-0" />
+              </button>
+            )}
+
             {/* 1. Đăng nhập tài khoản Google */}
             {(onOpenGoogleWorkspace || onSwitchGoogleAccount) && (
               <div className="rounded-2xl bg-gradient-to-r from-[#0d213a] via-[#0a1426] to-[#080d18] border border-cyan-500/40 shadow-[0_4px_18px_rgba(56,189,248,0.14)] overflow-hidden">
@@ -689,28 +726,47 @@ export const DrawerMenu: React.FC<DrawerMenuProps> = ({
                   </div>
                 )}
 
-                {onOptimizeMemory && (
-                  <div className="px-2.5 py-2 border-t border-cyan-500/20 bg-[#070d19]/80">
-                    <button
-                      type="button"
-                      disabled={optimizingMem}
-                      onClick={async () => {
-                        setOptimizingMem(true);
-                        try {
-                          await onOptimizeMemory();
-                        } finally {
-                          setOptimizingMem(false);
-                        }
-                      }}
-                      className="w-full py-1.5 px-2.5 rounded-xl bg-[#0e192f] hover:bg-[#162748] border border-cyan-500/35 text-cyan-200 font-semibold text-[11px] flex items-center justify-center space-x-1.5 active:scale-[0.98] transition disabled:opacity-60"
-                    >
-                      <RefreshCw className={`w-3.5 h-3.5 text-cyan-300 ${optimizingMem ? 'animate-spin' : ''}`} />
-                      <span>
-                        {optimizingMem
-                          ? 'Đang giải phóng RAM & Cache...'
-                          : 'Giải phóng RAM & Dọn Cache WASM'}
-                      </span>
-                    </button>
+                {(onOpenRamDiagnostics || onOptimizeMemory) && (
+                  <div className="px-2.5 py-2 border-t border-cyan-500/20 bg-[#070d19]/80 space-y-1.5">
+                    {onOpenRamDiagnostics && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          onOpenRamDiagnostics();
+                          onClose();
+                        }}
+                        className="w-full min-h-[44px] py-2 px-3 rounded-xl bg-gradient-to-r from-cyan-500/20 to-sky-600/15 hover:from-cyan-500/30 hover:to-sky-600/25 border border-cyan-400/45 text-cyan-100 font-bold text-[11.5px] flex items-center justify-between gap-2 whitespace-nowrap active:scale-[0.98] transition"
+                      >
+                        <span className="flex items-center space-x-2">
+                          <Activity className="w-4 h-4 text-cyan-300 shrink-0" />
+                          <span>Chẩn đoán RAM</span>
+                        </span>
+                        <ChevronRight className="w-4 h-4 text-cyan-300 shrink-0" />
+                      </button>
+                    )}
+
+                    {onOptimizeMemory && (
+                      <button
+                        type="button"
+                        disabled={optimizingMem}
+                        onClick={async () => {
+                          setOptimizingMem(true);
+                          try {
+                            await onOptimizeMemory();
+                          } finally {
+                            setOptimizingMem(false);
+                          }
+                        }}
+                        className="w-full py-1.5 px-2.5 rounded-xl bg-[#0e192f] hover:bg-[#162748] border border-cyan-500/30 text-cyan-200 font-semibold text-[11px] flex items-center justify-center space-x-1.5 whitespace-nowrap active:scale-[0.98] transition disabled:opacity-60"
+                      >
+                        <RefreshCw className={`w-3.5 h-3.5 text-cyan-300 shrink-0 ${optimizingMem ? 'animate-spin' : ''}`} />
+                        <span>
+                          {optimizingMem
+                            ? 'Đang giải phóng RAM & Cache...'
+                            : 'Giải phóng RAM & Dọn Cache WASM'}
+                        </span>
+                      </button>
+                    )}
                   </div>
                 )}
               </div>

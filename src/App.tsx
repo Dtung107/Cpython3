@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Header } from './components/Header';
 import { Editor, EditorHandle } from './components/Editor';
 import { Terminal } from './components/Terminal';
@@ -14,6 +14,7 @@ import { FileManagerModal } from './components/FileManagerModal';
 import { SettingsApiKeyModal } from './components/SettingsApiKeyModal';
 import { GoogleWorkspaceModal } from './components/GoogleWorkspaceModal';
 import { ApkGoogleAuthBridge } from './components/ApkGoogleAuthBridge';
+import { RamDiagnosticsModal } from './components/RamDiagnosticsModal';
 import { useDebouncedIdeLayout } from './hooks/useDebouncedIdeLayout';
 import { CodeFile, EngineType, ExecutionResult, AIDebugResult } from './types';
 import {
@@ -45,6 +46,8 @@ import {
   subscribePyodideWarmState,
   trimPyodideMemory,
   prunePyodideTransientCache,
+  runPeriodicPyodideMaintenance,
+  extractCodeImportSignature,
   PyodideWarmState,
 } from './services/pyodideService';
 import {
@@ -59,12 +62,15 @@ import {
   installCPythonPipPackage,
   subscribeCPythonWarmState,
   resetCPythonWarmState,
+  trimCPythonMemory,
   CPythonWarmState,
 } from './services/cpythonService';
 import {
   requestAIDebugStream,
   requestAIExplainStream,
   checkAIServerStatus,
+  pruneExpiredGeminiCache,
+  clearGeminiAnalysisCache,
 } from './services/geminiService';
 import {
   initGoogleAuth,
@@ -265,6 +271,7 @@ function MainIDEApp() {
   const [samplesModalOpen, setSamplesModalOpen] = useState(false);
   const [apiKeyModalOpen, setApiKeyModalOpen] = useState(false);
   const [googleModalOpen, setGoogleModalOpen] = useState(false);
+  const [ramDiagnosticsOpen, setRamDiagnosticsOpen] = useState(false);
 
   const showToast = (msg: string) => {
     setToastMessage(msg);
@@ -457,6 +464,28 @@ function MainIDEApp() {
   activeFileContentRef.current = activeFile?.content || DEFAULT_MAIN_PY;
   const isRunningRef = useRef<boolean>(isRunning);
   isRunningRef.current = isRunning;
+  const executionResultRef = useRef<ExecutionResult | null>(executionResult);
+  executionResultRef.current = executionResult;
+
+  const getTerminalMemoryStats = useCallback(() => {
+    const res = executionResultRef.current;
+    const prefix = preservedOutputPrefixRef.current;
+    const resPlots = res?.plotImages || [];
+    const prefixPlots = prefix?.plotImages || [];
+    const textBytes =
+      ((res?.stdout?.length || 0) +
+        (res?.stderr?.length || 0) +
+        (prefix?.stdout?.length || 0) +
+        (prefix?.stderr?.length || 0)) *
+      2;
+    const plotBytes =
+      resPlots.reduce((sum, img) => sum + (img?.length || 0), 0) +
+      prefixPlots.reduce((sum, img) => sum + (img?.length || 0), 0);
+    return {
+      terminalBufferBytes: textBytes + plotBytes,
+      terminalPlotCount: resPlots.length + prefixPlots.length,
+    };
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -466,31 +495,61 @@ function MainIDEApp() {
     };
   }, []);
 
-  // Native Android memory pressure & background trim handler (prevents prolonged-use OOM restarts)
+  // Native Android memory pressure, background trim, and periodic maintenance scheduler
   useEffect(() => {
+    const capRetainedTerminalBuffers = (maxStdout: number, maxStderr: number, maxPlots: number) => {
+      preservedOutputPrefixRef.current = {
+        stdout: preservedOutputPrefixRef.current.stdout.slice(-maxStdout),
+        stderr: preservedOutputPrefixRef.current.stderr.slice(-maxStderr),
+        plotImages: preservedOutputPrefixRef.current.plotImages.slice(-maxPlots),
+      };
+      setExecutionResult((prev) => {
+        if (!prev) return prev;
+        const curOut = prev.stdout || '';
+        const curErr = prev.stderr || '';
+        const curPlots = prev.plotImages || [];
+        if (
+          curOut.length <= maxStdout &&
+          curErr.length <= maxStderr &&
+          curPlots.length <= maxPlots
+        ) {
+          return prev;
+        }
+        return {
+          ...prev,
+          stdout: curOut.length > maxStdout ? curOut.slice(-maxStdout) : curOut,
+          stderr: curErr.length > maxStderr ? curErr.slice(-maxStderr) : curErr,
+          plotImages: curPlots.length > maxPlots ? curPlots.slice(-maxPlots) : curPlots,
+        };
+      });
+    };
+
     const handleMemoryTrim = (level: number) => {
-      const severe = level >= 15; // TRIM_MEMORY_RUNNING_CRITICAL / COMPLETE / MODERATE
+      // Android ComponentCallbacks2 levels:
+      // 5=RUNNING_MODERATE, 10=RUNNING_LOW, 15=RUNNING_CRITICAL, 20=UI_HIDDEN,
+      // 40=BACKGROUND, 60=MODERATE, 80=COMPLETE
+      const isUiHiddenOnly = level === 20;
+      const isCritical = level === 15 || level >= 60;
+      const isLowOrBackground = level >= 10 && !isUiHiddenOnly;
+
       if (!isRunningRef.current) {
         void trimPyodideMemory({
-          recycleIdleWorker: severe || level >= 10,
-          forceRecycle: level >= 40,
+          recycleIdleWorker: isCritical || level >= 40 || isLowOrBackground || isUiHiddenOnly,
+          forceRecycle: isCritical || level >= 40,
         });
       }
-      if (severe) {
-        preservedOutputPrefixRef.current = {
-          stdout: preservedOutputPrefixRef.current.stdout.slice(-40000),
-          stderr: preservedOutputPrefixRef.current.stderr.slice(-12000),
-          plotImages: preservedOutputPrefixRef.current.plotImages.slice(-2),
-        };
-        setExecutionResult((prev) => {
-          if (!prev) return prev;
-          return {
-            ...prev,
-            stdout: (prev.stdout || '').slice(-60000),
-            stderr: (prev.stderr || '').slice(-15000),
-            plotImages: (prev.plotImages || []).slice(-2),
-          };
-        });
+
+      trimCPythonMemory();
+      if (isCritical) {
+        clearGeminiAnalysisCache();
+        void prunePyodideTransientCache(false);
+        capRetainedTerminalBuffers(45000, 12000, 2);
+      } else {
+        pruneExpiredGeminiCache();
+        if (isLowOrBackground) {
+          void prunePyodideTransientCache(false);
+          capRetainedTerminalBuffers(90000, 24000, 3);
+        }
       }
     };
 
@@ -502,19 +561,34 @@ function MainIDEApp() {
         if (backgroundTrimTimer !== null) window.clearTimeout(backgroundTrimTimer);
         backgroundTrimTimer = window.setTimeout(() => {
           backgroundTrimTimer = null;
-          if (document.hidden && !isRunningRef.current && isMobileOrApk()) {
-            void trimPyodideMemory({ recycleIdleWorker: true });
+          if (document.hidden && !isRunningRef.current) {
+            void trimPyodideMemory({ recycleIdleWorker: isMobileOrApk() });
+            pruneExpiredGeminiCache();
+            trimCPythonMemory();
           }
-        }, 12000);
+        }, isMobileOrApk() ? 10000 : 25000);
       } else if (backgroundTrimTimer !== null) {
         window.clearTimeout(backgroundTrimTimer);
         backgroundTrimTimer = null;
       }
     };
 
+    // Periodic foreground memory maintenance (prevents gradual WASM/cache bloat in long sessions)
+    const periodicIntervalMs = isMobileOrApk() ? 75_000 : 150_000;
+    const periodicTimer = window.setInterval(() => {
+      if (document.hidden) return;
+      pruneExpiredGeminiCache();
+      trimCPythonMemory();
+      void runPeriodicPyodideMaintenance({ isPythonRunning: isRunningRef.current });
+      if (isMobileOrApk() && !isRunningRef.current) {
+        capRetainedTerminalBuffers(140000, 36000, 4);
+      }
+    }, periodicIntervalMs);
+
     document.addEventListener('visibilitychange', onVisibilityChange);
     return () => {
       if (backgroundTrimTimer !== null) window.clearTimeout(backgroundTrimTimer);
+      window.clearInterval(periodicTimer);
       document.removeEventListener('visibilitychange', onVisibilityChange);
       if ((window as any).__pydroidOnMemoryPressure === handleMemoryTrim) {
         delete (window as any).__pydroidOnMemoryPressure;
@@ -595,14 +669,25 @@ function MainIDEApp() {
     },
   });
 
-  // Pre-cache imported packages when user switches to a different file or sample code while Pyodide is ready
+  const activeImportSignature = extractCodeImportSignature(activeFile?.content || '');
+
+  // Pre-cache imported packages only when import signature changes while Pyodide is ready (never on every keystroke)
   useEffect(() => {
-    if (pyodideWarmState !== 'ready' || isRunning || !activeFile?.content) return;
+    if (
+      bootRecovery.safeMode ||
+      pyodideWarmState !== 'ready' ||
+      isRunning ||
+      !activeImportSignature
+    ) {
+      return;
+    }
     const timer = setTimeout(() => {
-      void prewarmCodeDependencies(activeFile.content);
-    }, 550);
+      if (!document.hidden && !isRunningRef.current) {
+        void prewarmCodeDependencies(activeFileContentRef.current);
+      }
+    }, 650);
     return () => clearTimeout(timer);
-  }, [activeFileId, activeFile?.content, pyodideWarmState, isRunning]);
+  }, [activeFileId, activeImportSignature, pyodideWarmState, isRunning, bootRecovery.safeMode]);
 
   // Sync installed package list from CPython server when Pip modal opens in CPython mode
   useEffect(() => {
@@ -1541,6 +1626,21 @@ function MainIDEApp() {
     showToast(`Đã gỡ ${pkgName} khỏi danh sách đã lưu.`);
   };
 
+  // Quick clear all terminal outputs, plots, stdin buffers and temporary runtime data without re-running code
+  const handleQuickClearTerminal = async () => {
+    preservedOutputPrefixRef.current = { stdout: '', stderr: '', plotImages: [] };
+    setExecutionResult(null);
+    setSessionInputs([]);
+    setPreloadedStdin('');
+    setIsWaitingInput(false);
+    setInputPromptText('input():');
+    setRunStatusMessage(null);
+    if (!isRunningRef.current) {
+      await trimPyodideMemory({ recycleIdleWorker: false, forceRecycle: false }).catch(() => {});
+    }
+    showToast('Đã xoá nhanh Terminal & dữ liệu tạm phiên trước.');
+  };
+
   // Clear current view (no window.confirm)
   const handleClearCurrentView = () => {
     if (viewMode === 'editor') {
@@ -1549,7 +1649,10 @@ function MainIDEApp() {
       preservedOutputPrefixRef.current = { stdout: '', stderr: '', plotImages: [] };
       setExecutionResult(null);
       setSessionInputs([]);
+      setPreloadedStdin('');
       setIsWaitingInput(false);
+      setInputPromptText('input():');
+      setRunStatusMessage(null);
     }
   };
 
@@ -1713,9 +1816,21 @@ function MainIDEApp() {
         onExportFullBackup={handleExportFullBackup}
         onImportFullBackupFile={handleImportFullBackupFile}
         onRestoreFullBackupFromFolder={handleRestoreFullBackupFromFolder}
+        onOpenRamDiagnostics={() => setRamDiagnosticsOpen(true)}
+        onQuickClearTerminal={handleQuickClearTerminal}
+        hasTerminalData={Boolean(
+          executionResult?.stdout ||
+            executionResult?.stderr ||
+            executionResult?.plotImages?.length ||
+            sessionInputs.length ||
+            preloadedStdin ||
+            isWaitingInput
+        )}
         onOptimizeMemory={async () => {
           preservedOutputPrefixRef.current = { stdout: '', stderr: '', plotImages: [] };
           setExecutionResult(null);
+          clearGeminiAnalysisCache();
+          trimCPythonMemory();
           await trimPyodideMemory({ forceRecycle: !isRunningRef.current });
           await clearTransientCachesPreservingUserCode();
           showToast('Đã giải phóng RAM & dọn bộ nhớ đệm WASM (giữ nguyên mã Python).');
@@ -1920,6 +2035,38 @@ function MainIDEApp() {
           handleCheckAiStatus();
           resetCPythonWarmState();
           void prewarmCPythonServer({ force: true });
+        }}
+      />
+
+      {/* Pyodide RAM Diagnostics & Active Cleanup Modal */}
+      <RamDiagnosticsModal
+        isOpen={ramDiagnosticsOpen}
+        onClose={() => setRamDiagnosticsOpen(false)}
+        isPythonRunning={isRunning}
+        getTerminalMemoryStats={getTerminalMemoryStats}
+        onLightCleanup={async () => {
+          pruneExpiredGeminiCache();
+          trimCPythonMemory();
+          await trimPyodideMemory({ recycleIdleWorker: false, forceRecycle: false });
+          await prunePyodideTransientCache(false);
+          showToast('Đã dọn rác GC & cache tạm (Pyodide vẫn sẵn sàng).');
+          return {
+            ok: true,
+            message: 'Dọn rác Python GC & bộ nhớ đệm thành công (giữ nguyên động cơ Pyodide).',
+          };
+        }}
+        onDeepCleanup={async () => {
+          preservedOutputPrefixRef.current = { stdout: '', stderr: '', plotImages: [] };
+          setExecutionResult(null);
+          clearGeminiAnalysisCache();
+          trimCPythonMemory();
+          await trimPyodideMemory({ forceRecycle: !isRunningRef.current });
+          await clearTransientCachesPreservingUserCode();
+          showToast('Đã giải phóng sâu WASM & Output (giữ nguyên tệp .py).');
+          return {
+            ok: true,
+            message: 'Đã giải phóng sâu WASM Heap, Output Terminal & Cache tạm.',
+          };
         }}
       />
     </div>

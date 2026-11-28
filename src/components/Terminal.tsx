@@ -114,6 +114,15 @@ export const Terminal: React.FC<TerminalProps> = ({
     }
   }, [result?.stderr, isWaitingInput]);
 
+  // Reset transient UI state when terminal is cleared
+  useEffect(() => {
+    if (!result) {
+      setSelectedPlot(null);
+      setDismissedError(false);
+      setInputValue('');
+    }
+  }, [result]);
+
   const handleInputSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!inputValue.trim() && !isWaitingInput) return;

@@ -131,6 +131,24 @@ export function clearGeminiAnalysisCache(): void {
   explainCache.clear();
 }
 
+export function pruneExpiredGeminiCache(): number {
+  const now = Date.now();
+  let removed = 0;
+  for (const [k, v] of debugCache) {
+    if (now > v.expiresAt) {
+      debugCache.delete(k);
+      removed++;
+    }
+  }
+  for (const [k, v] of explainCache) {
+    if (now > v.expiresAt) {
+      explainCache.delete(k);
+      removed++;
+    }
+  }
+  return removed;
+}
+
 export function getGeminiCacheStats(): { debugEntries: number; explainEntries: number } {
   return {
     debugEntries: debugCache.size,

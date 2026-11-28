@@ -1,7 +1,7 @@
 {
   "app": "Pydroid 3 Web",
-  "generatedAt": "2026-11-28T02:12:36.790Z",
-  "fileCount": 51,
+  "generatedAt": "2026-11-28T14:00:59.311Z",
+  "fileCount": 52,
   "files": [
     ".env.example",
     ".github/workflows/build-apk.yml",
@@ -27,6 +27,7 @@
     "src/components/Header.tsx",
     "src/components/MobileKeyboardBar.tsx",
     "src/components/PipManagerModal.tsx",
+    "src/components/RamDiagnosticsModal.tsx",
     "src/components/SampleCodesModal.tsx",
     "src/components/SettingsApiKeyModal.tsx",
     "src/components/ShortcutConfigModal.tsx",
